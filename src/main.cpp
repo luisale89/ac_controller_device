@@ -67,7 +67,7 @@ float h = 0;
 
 unsigned long currentMillis = millis();
 unsigned long previousMillis = 0;   // Stores last time temperature was published
-const unsigned long interval = 10000;        // Interval at which to publish sensor readings - 10' seconds
+const unsigned long interval = 5000;        // Interval at which to publish sensor readings - 5' seconds
 unsigned long start;                // used to measure Pairing time
 
 // simulate temperature reading
@@ -182,7 +182,7 @@ PairingStatus autoPairing(){
     case PAIR_REQUESTED:
     // time out to allow receiving response from server
     currentMillis = millis();
-    if(currentMillis - previousMillis > 250) {
+    if(currentMillis - previousMillis > 1000) { // 1 second for server response.
       previousMillis = currentMillis;
       // time out expired,  try next channel
       channel ++;
