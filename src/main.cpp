@@ -1,3 +1,8 @@
+// logging
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include <esp_log.h>
+static const char* TAG = "HVAC_BASE_CTRL";
+// libraries
 #include <Arduino.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -70,19 +75,35 @@ unsigned long previousMillis = 0;   // Stores last time temperature was publishe
 const unsigned long interval = 5000;        // Interval at which to publish sensor readings - 5' seconds
 unsigned long start;                // used to measure Pairing time
 
+//logger function
+void debug_logger(const char *message) {
+  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "%s", message);
+}
+
+void info_logger(const char *message) {
+  ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "%s", message);
+}
+
+void error_logger(const char *message) {
+  ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "%s", message);
+}
+
 // simulate temperature reading
 float readDHTTemperature() {
+  debug_logger("reading ambient temperature");
   t = random(0,40);
   return t;
 }
 
 // simulate humidity reading
 float readDHTHumidity() {
+  debug_logger("reading ambient humidity.");
   h = random(0,100);
   return h;
 }
 
 void addPeer(const uint8_t * mac_addr, uint8_t chan){
+  debug_logger("adding new peer to peer list.");
   esp_now_peer_info_t peer;
   ESP_ERROR_CHECK(esp_wifi_set_channel(chan ,WIFI_SECOND_CHAN_NONE));
   esp_now_del_peer(mac_addr);
@@ -91,7 +112,7 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan){
   peer.encrypt = false;
   memcpy(peer.peer_addr, mac_addr, sizeof(uint8_t[6]));
   if (esp_now_add_peer(&peer) != ESP_OK){
-    Serial.println("Failed to add peer");
+    error_logger("esp peer could'n be added");
     return;
   }
   memcpy(serverAddress, mac_addr, sizeof(uint8_t[6]));
@@ -105,6 +126,7 @@ void printMAC(const uint8_t * mac_addr){
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+
   Serial.print("\r\nLast Packet Send Status:\t");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
@@ -154,18 +176,9 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
 PairingStatus autoPairing(){
   switch(pairingStatus) {
     case PAIR_REQUEST:
-    Serial.print("Pairing request on channel "  );
-    Serial.println(channel);
-
+    ESP_LOG_LEVEL(LOG_LOCAL_LEVEL, TAG, "Pairing request on channel: %d", channel);
     // set WiFi channel   
     ESP_ERROR_CHECK(esp_wifi_set_channel(channel,  WIFI_SECOND_CHAN_NONE));
-    if (esp_now_init() != ESP_OK) {
-      Serial.println("Error initializing ESP-NOW");
-    }
-
-    // set callback routines
-    esp_now_register_send_cb(OnDataSent);
-    esp_now_register_recv_cb(OnDataRecv);
   
     // set pairing data to send to the server
     pairing_data.msg_type = PAIRING;
@@ -198,16 +211,29 @@ PairingStatus autoPairing(){
     break;
   }
   return pairingStatus;
-}  
+}
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println();
+  // set logging level
+  esp_log_level_set("*", ESP_LOG_DEBUG);        // set all components to INFO level
+
+  // setup begin
+  debug_logger("setup begin.");
+  Serial.begin(115200); 
   pinMode(BUILTIN_LED, OUTPUT);
+  //WiFi
+  WiFi.mode(WIFI_AP);
   Serial.print("Client Board MAC Address:  ");
   Serial.println(WiFi.macAddress());
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  // esp_now;
+  if (esp_now_init() != ESP_OK) {
+    error_logger("error initializing esp now!");
+  }
+
+  // set callback routines
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
   start = millis();
 
   #ifdef SAVE_CHANNEL 
