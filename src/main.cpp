@@ -1,20 +1,47 @@
 // logging
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include <esp_log.h>
-static const char* TAG = "HVAC_BASE_CTRL";
+static const char* TAG = "main";
 // libraries
-#include <Arduino.h>
+#include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <WiFi.h>
 #include <EEPROM.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <secrets.h>
+#include <ArduinoJson.h>
 
-// Set your Board and Server ID 
+//pinout
+#define AUTO_RELAY 18
+#define VENT_RELAY 17
+#define COMP_RELAY 16
+#define NETWORK_LED 2
+#define Q3_INPUT 14
+#define Q2_INPUT 27
+#define Q1_INPUT 26
+#define RETURN_TEMP 25
+#define SUPPLY_TEMP 33
+#define FLOAT_SWTCH 32
+#define NOW_CNF 35
+// Set your Board ID 
 #define BOARD_ID 1
 #define MAX_CHANNEL 11  // for North America
-#define BUILTIN_LED 2
+
+// oneWire and DallasTemperature
+OneWire ow_return_temp(RETURN_TEMP);
+OneWire ow_supply_temp(SUPPLY_TEMP);
+DallasTemperature air_return_sensor(&ow_return_temp);
+DallasTemperature air_supply_sensor(&ow_supply_temp);
+int tempSensorResolution = 12; //bits
+int tempRequestDelay = 0;
+float air_return_temp = 0;
+float air_supply_temp = 0;
 
 uint8_t serverAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+int channel = 1; // esp-now communication channel.
+String deviceID = "";
 
 enum MessageType {PAIRING, DATA,};
 enum SenderID {SERVER, CONTROLLER, MONITOR,};
@@ -61,18 +88,11 @@ controller_data_struct outgoing_data;  // data to send
 incoming_settings_struct incoming_data;  // data received
 pairing_data_struct pairing_data;
 
-#ifdef SAVE_CHANNEL
-  int lastChannel;
-#endif  
-int channel = 1;
- 
-// simulate temperature and humidity data
-float t = 0;
-float h = 0;
-
+// time vars.
+unsigned long lastTempRequest = 0;
 unsigned long currentMillis = millis();
 unsigned long previousMillis = 0;   // Stores last time temperature was published
-const unsigned long interval = 5000;        // Interval at which to publish sensor readings - 5' seconds
+const unsigned long interval = 5000;// Interval at which to publish sensor readings - 5' seconds
 unsigned long start;                // used to measure Pairing time
 
 //logger function
@@ -88,20 +108,51 @@ void error_logger(const char *message) {
   ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "%s", message);
 }
 
-// simulate temperature reading
-float readDHTTemperature() {
-  debug_logger("reading ambient temperature");
-  t = random(0,40);
-  return t;
+//-functions
+bool valid_temp_value(float measurement) {
+  char message_buffer[40];
+  char name[8] = "ds18B20";
+
+  if (measurement == -127) {
+    sprintf(message_buffer, "Error -127; [%s]", name);
+    error_logger(message_buffer);
+    return false;
+  }
+  return true;
 }
 
-// simulate humidity reading
-float readDHTHumidity() {
-  debug_logger("reading ambient humidity.");
-  h = random(0,100);
-  return h;
+void update_temperatures()
+{
+  if (millis() - lastTempRequest >= tempRequestDelay) {
+    //-
+    float returnBuffer = air_return_sensor.getTempCByIndex(0);
+    ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Return temperature: %3.2f °C", returnBuffer);
+    float supplyBuffer = air_supply_sensor.getTempCByIndex(0);
+    ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Supply temperature: %3.2f °C", returnBuffer);
+    if (!valid_temp_value(returnBuffer) || !valid_temp_value(supplyBuffer))
+    {
+      error_logger("invalid ds18b20 redings.");
+      return;
+    }
+    // update global variable.
+    air_return_temp = returnBuffer;
+    air_return_sensor.requestTemperatures();
+    //-
+    air_supply_temp = supplyBuffer;
+    air_supply_sensor.requestTemperatures();
+    //- set timer
+    lastTempRequest = millis();
+  }
+  return;
 }
 
+void update_IO()
+{
+  // to-do: function tu update inputs and outputs.
+  return;
+}
+
+//- *esp_now functions
 void addPeer(const uint8_t * mac_addr, uint8_t chan){
   debug_logger("adding new peer to peer list.");
   esp_now_peer_info_t peer;
@@ -118,11 +169,13 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan){
   memcpy(serverAddress, mac_addr, sizeof(uint8_t[6]));
 }
 
-void printMAC(const uint8_t * mac_addr){
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+String get_device_id(const uint8_t * mac_addr) {
+  char mac_str[18];
+  snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  Serial.print(macStr);
+  // return mac_str;
+  String str = (char*) mac_str;
+  return str;
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -133,7 +186,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) { 
   Serial.print("Packet received from: ");
-  printMAC(mac_addr);
+  get_device_id(mac_addr);
   Serial.println();
   Serial.print("data size = ");
   Serial.println(sizeof(incomingData));
@@ -153,9 +206,9 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
   case PAIRING:    // we received pairing data from server
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
     if (pairing_data.sender_id == 0) {              // the message comes from server
-      printMAC(mac_addr);
+      get_device_id(mac_addr);
       Serial.print("Pairing done for ");
-      printMAC(pairing_data.macAddr);
+      get_device_id(pairing_data.macAddr);
       Serial.print(" on channel " );
       Serial.print(pairing_data.channel);    // channel used by the server
       Serial.print(" in ");
@@ -213,39 +266,62 @@ PairingStatus autoPairing(){
   return pairingStatus;
 }
 
+// -setup
 void setup() {
-  // set logging level
-  esp_log_level_set("*", ESP_LOG_DEBUG);        // set all components to INFO level
-
   // setup begin
-  debug_logger("setup begin.");
+  esp_log_level_set("*", ESP_LOG_DEBUG); 
   Serial.begin(115200); 
-  pinMode(BUILTIN_LED, OUTPUT);
+  //set all logger on debug.
+  debug_logger("** setup start. **");
+  //pinout def
+  info_logger("pins settings");
+  pinMode(AUTO_RELAY, OUTPUT);
+  pinMode(VENT_RELAY, OUTPUT);
+  pinMode(COMP_RELAY, OUTPUT);
+  pinMode(NETWORK_LED, OUTPUT);
+  pinMode(Q3_INPUT, INPUT_PULLUP);
+  pinMode(Q2_INPUT, INPUT_PULLUP);
+  pinMode(Q1_INPUT, INPUT_PULLUP);
+  pinMode(NOW_CNF, INPUT);
+  info_logger("pins settings done.");
+  // Inicio Sensores OneWire
+  info_logger("OneWire sensors settings!");
+  air_return_sensor.begin();
+  air_return_sensor.setResolution(tempSensorResolution);
+  air_return_sensor.setWaitForConversion(false);
+  air_supply_sensor.begin();
+  air_supply_sensor.setResolution(tempSensorResolution);
+  air_supply_sensor.setWaitForConversion(false);
+  //first temp. request.
+  air_return_sensor.requestTemperatures();
+  air_supply_sensor.requestTemperatures();
+  lastTempRequest = millis();
+  tempRequestDelay = 750 / (1 << (12 - tempSensorResolution));
+  info_logger("OneWire sensors settings done.");
   //WiFi
+  info_logger("WiFi settings.");
   WiFi.mode(WIFI_AP);
-  Serial.print("Client Board MAC Address:  ");
-  Serial.println(WiFi.macAddress());
-  // esp_now;
+  info_logger("MAC Address:  ->");
+  info_logger(WiFi.macAddress().c_str());
+  info_logger("WiFi settings done.");
+  //-esp now
+  info_logger("esp-now settings");
+  uint8_t hubMacAddress[6];
+  esp_err_t ret = esp_wifi_get_mac(WIFI_IF_AP, hubMacAddress);
+  if (ret != ESP_OK) {
+    error_logger("could not read mac address.");
+  }
+  deviceID = get_device_id(hubMacAddress);
   if (esp_now_init() != ESP_OK) {
     error_logger("error initializing esp now!");
   }
-
-  // set callback routines
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
-
+  info_logger("esp-now settings done.");
   start = millis();
-
-  #ifdef SAVE_CHANNEL 
-    EEPROM.begin(10);
-    lastChannel = EEPROM.read(0);
-    Serial.println(lastChannel);
-    if (lastChannel >= 1 && lastChannel <= MAX_CHANNEL) {
-      channel = lastChannel; 
-    }
-    Serial.println(channel);
-  #endif  
   pairingStatus = PAIR_REQUEST;
+
+  info_logger("setup finished --!.");
 }  
 
 void loop() {
@@ -257,8 +333,8 @@ void loop() {
       //Set values to send
       outgoing_data.msg_type = DATA;
       outgoing_data.sender_id = BOARD_ID;
-      outgoing_data.evap_air_in_temp = readDHTTemperature();
-      outgoing_data.evap_air_out_temp = readDHTHumidity();
+      outgoing_data.evap_air_in_temp = air_return_temp;
+      outgoing_data.evap_air_out_temp = air_supply_temp;
       esp_err_t result = esp_now_send(serverAddress, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
     }
   }
