@@ -39,7 +39,7 @@ int tempRequestDelay = 0;
 float air_return_temp = 0;
 float air_supply_temp = 0;
 
-uint8_t serverAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+uint8_t server_mac_address[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 int channel = 1; // esp-now communication channel.
 String deviceID = "";
 
@@ -92,8 +92,8 @@ pairing_data_struct pairing_data;
 unsigned long lastTempRequest = 0;
 unsigned long currentMillis = millis();
 unsigned long previousMillis = 0;   // Stores last time temperature was published
-const unsigned long interval = 5000;// Interval at which to publish sensor readings - 5' seconds
 unsigned long start;                // used to measure Pairing time
+const unsigned long interval = 5000;// Interval at which to publish sensor readings - 5' seconds
 
 //logger function
 void debug_logger(const char *message) {
@@ -109,7 +109,7 @@ void error_logger(const char *message) {
 }
 
 //-functions
-bool valid_temp_value(float measurement) {
+bool is_valid_temp_value(float measurement) {
   char message_buffer[40];
   char name[8] = "ds18B20";
 
@@ -129,7 +129,7 @@ void update_temperatures()
     ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Return temperature: %3.2f °C", returnBuffer);
     float supplyBuffer = air_supply_sensor.getTempCByIndex(0);
     ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Supply temperature: %3.2f °C", returnBuffer);
-    if (!valid_temp_value(returnBuffer) || !valid_temp_value(supplyBuffer))
+    if (!is_valid_temp_value(returnBuffer) || !is_valid_temp_value(supplyBuffer))
     {
       error_logger("invalid ds18b20 redings.");
       return;
@@ -152,6 +152,35 @@ void update_IO()
   return;
 }
 
+//- mac address parse
+bool str2mac(const char* mac, uint8_t* values){
+    if(6 == sscanf(mac,"%02x:%02x:%02x:%02x:%02x:%02x",&values[0], &values[1], &values[2],&values[3], &values[4], &values[5])){
+        return true;
+    }else{
+        return false;
+    }
+}
+
+//- load server mac address from filesystem.
+void load_server_address_from_fs() {
+  const char test_mac[] = "FF:AA:05:24:33:24";
+  channel = 1; // channel also is stored in fs.
+  uint8_t mac_buffer[] = { 0 };
+  // fs string: "{server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
+  //-
+  const bool parse_success = str2mac(test_mac, mac_buffer);
+  if (parse_success) {
+    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Server Mac Address: %02X:%02X:%02X:%02X:%02X:%02X", 
+    mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
+
+    //- update server_mac_address variable
+    memcpy(server_mac_address, mac_buffer, sizeof(uint8_t[6]));
+
+  } else {
+    error_logger("fail to load server mac address from file system.");
+  }
+}
+
 //- *esp_now functions
 void addPeer(const uint8_t * mac_addr, uint8_t chan){
   debug_logger("adding new peer to peer list.");
@@ -166,7 +195,7 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan){
     error_logger("esp peer could'n be added");
     return;
   }
-  memcpy(serverAddress, mac_addr, sizeof(uint8_t[6]));
+  memcpy(server_mac_address, mac_addr, sizeof(uint8_t[6]));
 }
 
 String get_device_id(const uint8_t * mac_addr) {
@@ -215,11 +244,6 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
       Serial.print(millis()-start);
       Serial.println("ms");
       addPeer(pairing_data.macAddr, pairing_data.channel); // add the server  to the peer list 
-      #ifdef SAVE_CHANNEL
-        lastChannel = pairing_data.channel;
-        EEPROM.write(0, pairing_data.channel);
-        EEPROM.commit();
-      #endif  
       pairingStatus = PAIR_PAIRED;             // set the pairing status
     }
     break;
@@ -239,8 +263,8 @@ PairingStatus autoPairing(){
     pairing_data.channel = channel;
 
     // add peer and send request
-    addPeer(serverAddress, channel);
-    esp_now_send(serverAddress, (uint8_t *) &pairing_data, sizeof(pairing_data));
+    addPeer(server_mac_address, channel);
+    esp_now_send(server_mac_address, (uint8_t *) &pairing_data, sizeof(pairing_data));
     previousMillis = millis();
     pairingStatus = PAIR_REQUESTED;
     break;
@@ -335,7 +359,7 @@ void loop() {
       outgoing_data.sender_id = BOARD_ID;
       outgoing_data.evap_air_in_temp = air_return_temp;
       outgoing_data.evap_air_out_temp = air_supply_temp;
-      esp_err_t result = esp_now_send(serverAddress, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
+      esp_err_t result = esp_now_send(server_mac_address, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
     }
   }
 }
