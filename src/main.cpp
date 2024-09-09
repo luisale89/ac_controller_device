@@ -140,6 +140,55 @@ void save_data_in_fs(String data_to_save, const char *target_file) {
   return;
 }
 
+// print mac address.
+String print_mac(const uint8_t * mac_addr) {
+  char mac_str[18];
+  snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  // return mac_str;
+  String str = (char*) mac_str;
+  return str;
+}
+
+//- mac address parser
+bool str2mac(const char* mac, uint8_t* values){
+    if(6 == sscanf(mac,"%02x:%02x:%02x:%02x:%02x:%02x",&values[0], &values[1], &values[2],&values[3], &values[4], &values[5])){
+        return true;
+    }else{
+        return false;
+    }
+}
+
+//get device id from mac address.
+String get_device_id(const uint8_t * mac_addr) {
+  char mac_str[18];
+  snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  // return mac_str;
+  String str = (char*) mac_str;
+  return str;
+}
+
+//- load server mac address from filesystem.
+void load_server_from_fs() {
+  const char test_mac[] = "FF:AA:05:24:33:24";
+  channel = 1; // channel also is stored in fs.
+  uint8_t mac_buffer[6] = { 0 };
+  // fs string: "{server_id: FFFFFFFFFFFF, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
+  //-
+  const bool parse_success = str2mac(test_mac, mac_buffer);
+  if (parse_success) {
+    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Server Mac Address: %02X:%02X:%02X:%02X:%02X:%02X", 
+    mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
+
+    //- update server_mac_address variable
+    memcpy(server_mac_address, mac_buffer, sizeof(mac_buffer));
+
+  } else {
+    error_logger("fail to load server mac address from file system.");
+  }
+}
+
 //-functions
 bool temp_is_valid(float measurement) {
   char message_buffer[40];
@@ -158,9 +207,9 @@ void update_temperatures()
   if (millis() - lastTempRequest >= tempRequestDelay) {
     //-
     float returnBuffer = air_return_sensor.getTempCByIndex(0);
-    ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Return temperature: %3.2f °C", returnBuffer);
+    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Return temperature: %3.2f °C", returnBuffer);
     float supplyBuffer = air_supply_sensor.getTempCByIndex(0);
-    ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Supply temperature: %3.2f °C", returnBuffer);
+    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Supply temperature: %3.2f °C", supplyBuffer);
     if (!temp_is_valid(returnBuffer) || !temp_is_valid(supplyBuffer))
     {
       error_logger("invalid ds18b20 redings.");
@@ -184,35 +233,6 @@ void update_IO()
   return;
 }
 
-//- mac address parse
-bool str2mac(const char* mac, uint8_t* values){
-    if(6 == sscanf(mac,"%02x:%02x:%02x:%02x:%02x:%02x",&values[0], &values[1], &values[2],&values[3], &values[4], &values[5])){
-        return true;
-    }else{
-        return false;
-    }
-}
-
-//- load server mac address from filesystem.
-void load_server_from_fs() {
-  const char test_mac[] = "FF:AA:05:24:33:24";
-  channel = 1; // channel also is stored in fs.
-  uint8_t mac_buffer[6] = { 0 };
-  // fs string: "{server_id: FFFFFFFFFFFF, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
-  //-
-  const bool parse_success = str2mac(test_mac, mac_buffer);
-  if (parse_success) {
-    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Server Mac Address: %02X:%02X:%02X:%02X:%02X:%02X", 
-    mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
-
-    //- update server_mac_address variable
-    memcpy(server_mac_address, mac_buffer, sizeof(mac_buffer));
-
-  } else {
-    error_logger("fail to load server mac address from file system.");
-  }
-}
-
 //- *esp_now functions
 void addPeer(const uint8_t * mac_addr, uint8_t chan){
   debug_logger("adding new peer to peer list.");
@@ -228,26 +248,6 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan){
     return;
   }
   memcpy(server_mac_address, mac_addr, sizeof(uint8_t[6]));
-}
-
-//get device id from mac address.
-String get_device_id(const uint8_t * mac_addr) {
-  char mac_str[18];
-  snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
-           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  // return mac_str;
-  String str = (char*) mac_str;
-  return str;
-}
-
-// print mac address.
-String print_mac(const uint8_t * mac_addr) {
-  char mac_str[18];
-  snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  // return mac_str;
-  String str = (char*) mac_str;
-  return str;
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
