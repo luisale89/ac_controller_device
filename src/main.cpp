@@ -48,7 +48,7 @@ String deviceID = "";
 enum MessageType {PAIRING, DATA,};
 enum SenderID {SERVER, CONTROLLER, MONITOR,};
 enum SystemModes {SYS_OFF, SYS_FAN, SYS_COOL, SYS_AUTO_CL,};
-enum PairingStatus {NOT_PAIRED, PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED,};
+enum PairingStatus {NOT_PAIRED, PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, PAIR_IDLE};
 PairingStatus pairingStatus = NOT_PAIRED;
 MessageType espnow_msg_type;
 SystemModes espnow_system_mode;
@@ -143,7 +143,7 @@ void save_data_in_fs(String data_to_save, const char *target_file) {
 // print mac address.
 String print_mac(const uint8_t * mac_addr) {
   char mac_str[18];
-  snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+  snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
   // return mac_str;
   String str = (char*) mac_str;
@@ -169,8 +169,25 @@ String get_device_id(const uint8_t * mac_addr) {
   return str;
 }
 
+void save_server_in_fs() {
+  //- save server info in spiffs.
+  info_logger("[esp-now] saving server data in fs.");
+  JsonDocument server_json;
+  String data;
+  server_json["server_id"] = get_device_id(server_mac_address);
+  server_json["server_mac"] = print_mac(server_mac_address);
+  server_json["server_chan"] = channel;
+
+  serializeJson(server_json, data);
+  save_data_in_fs(data, "now_server.txt");
+
+  return;
+}
+
+
 //- load server mac address from filesystem.
 void load_server_from_fs() {
+  info_logger("[esp-now] loading server data from fs.");
   JsonDocument server_json;
   String server_data = load_data_from_fs("now_server.txt");
   DeserializationError error = deserializeJson(server_json, server_data);
@@ -195,10 +212,9 @@ void load_server_from_fs() {
   }
 
   uint8_t mac_buffer[6] = { 0 };
-  // fs string: "{server_id: FFFFFFFFFFFF, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
+  // fs string: "{server_id: ffffffffffff, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
   //-
-  const bool parse_success = str2mac(server_mac, mac_buffer);
-  if (parse_success) {
+  if (str2mac(server_mac, mac_buffer)) {
     ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Server Mac Address: %02X:%02X:%02X:%02X:%02X:%02X", 
     mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
 
@@ -211,11 +227,21 @@ void load_server_from_fs() {
     error_logger("fail to parse server mac address from file system.");
   }
 
+  if (strcmp(server_id, "ffffffffffff") != 0) {
+    //- server address has never been set. configure idle mode for pairing process.
+    info_logger("server mac address has never been set.");
+    info_logger("Pairing status set to idle, waiting for ap button to begin pairing..");
+    pairingStatus = PAIR_IDLE;
+  } else {
+    info_logger("ready to begin pairing requests..");
+    pairingStatus = PAIR_REQUEST;
+  }
+
   return;
 }
 
 //-functions
-bool temp_is_valid(float measurement) {
+bool is_valid_temp(float measurement) {
   char message_buffer[40];
   char name[8] = "ds18B20";
 
@@ -227,7 +253,7 @@ bool temp_is_valid(float measurement) {
   return true;
 }
 
-void update_temperatures()
+void update_temperature_readings()
 {
   if (millis() - lastTempRequest >= tempRequestDelay) {
     //-
@@ -235,7 +261,7 @@ void update_temperatures()
     ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Return temperature: %3.2f °C", returnBuffer);
     float supplyBuffer = air_supply_sensor.getTempCByIndex(0);
     ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Supply temperature: %3.2f °C", supplyBuffer);
-    if (!temp_is_valid(returnBuffer) || !temp_is_valid(supplyBuffer))
+    if (!is_valid_temp(returnBuffer) || !is_valid_temp(supplyBuffer))
     {
       error_logger("invalid ds18b20 redings.");
       return;
@@ -420,14 +446,12 @@ void setup() {
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
-  info_logger("esp-now settings done.");
-  start = millis();
-  pairingStatus = PAIR_REQUEST;
-
   //LOAD DATA FROM FS
   load_server_from_fs();
+  info_logger("[esp-now] settings done.");
 
   // SETUP FINISHED
+  start = millis();
   info_logger("setup finished --!.");
 }  
 
