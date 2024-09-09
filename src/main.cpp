@@ -42,7 +42,7 @@ float air_supply_temp = 0;
 // esp-now variables
 uint8_t server_mac_address[] = { 0 };
 int channel = 1; // esp-now communication channel.
-String server_id = "";
+String serverID = "";
 String deviceID = "";
 
 enum MessageType {PAIRING, DATA,};
@@ -171,22 +171,47 @@ String get_device_id(const uint8_t * mac_addr) {
 
 //- load server mac address from filesystem.
 void load_server_from_fs() {
-  const char test_mac[] = "FF:AA:05:24:33:24";
-  channel = 1; // channel also is stored in fs.
+  JsonDocument server_json;
+  String server_data = load_data_from_fs("now_server.txt");
+  DeserializationError error = deserializeJson(server_json, server_data);
+
+  if (error)
+  {
+    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "server_json Deserialization error raised with code: %s", error.c_str());
+    return;
+  }
+
+  const char *server_id = server_json["server_id"] | "null";
+  const char *server_mac = server_json["server_mac"] | "null";
+  const int server_chan = server_json["server_chan"] | 1;
+
+  if (strcmp(server_id, "null") == 0) {
+    error_logger("server id not found in fs.");
+    return;
+  }
+  if (strcmp(server_mac, "null") == 0) {
+    error_logger("server mac addres not found in fs.");
+    return;
+  }
+
   uint8_t mac_buffer[6] = { 0 };
   // fs string: "{server_id: FFFFFFFFFFFF, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
   //-
-  const bool parse_success = str2mac(test_mac, mac_buffer);
+  const bool parse_success = str2mac(server_mac, mac_buffer);
   if (parse_success) {
     ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Server Mac Address: %02X:%02X:%02X:%02X:%02X:%02X", 
     mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
 
-    //- update server_mac_address variable
+    //- update server variables.
     memcpy(server_mac_address, mac_buffer, sizeof(mac_buffer));
+    serverID = server_id;
+    channel = server_chan;
 
   } else {
-    error_logger("fail to load server mac address from file system.");
+    error_logger("fail to parse server mac address from file system.");
   }
+
+  return;
 }
 
 //-functions
@@ -400,7 +425,7 @@ void setup() {
   pairingStatus = PAIR_REQUEST;
 
   //LOAD DATA FROM FS
-  // load_server_from_fs();
+  load_server_from_fs();
 
   // SETUP FINISHED
   info_logger("setup finished --!.");
