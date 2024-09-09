@@ -39,8 +39,10 @@ int tempRequestDelay = 0;
 float air_return_temp = 0;
 float air_supply_temp = 0;
 
-uint8_t server_mac_address[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+// esp-now variables
+uint8_t server_mac_address[] = { 0 };
 int channel = 1; // esp-now communication channel.
+String server_id = "";
 String deviceID = "";
 
 enum MessageType {PAIRING, DATA,};
@@ -52,10 +54,6 @@ MessageType espnow_msg_type;
 SystemModes espnow_system_mode;
 SenderID espnow_peer_id;
 
-//Structure to send data
-//Must match the receiver structure
-// Structure example to receive data
-// Must match the sender structure
 typedef struct controller_data_struct {
   uint8_t msg_type;             // (1 byte)
   uint8_t sender_id;            // (1 byte)
@@ -108,8 +106,42 @@ void error_logger(const char *message) {
   ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "%s", message);
 }
 
+// función que carga una String que contiene toda la información dentro del target_file del SPIFFS.
+String load_data_from_fs(const char *target_file) {
+  //-
+  File f = SPIFFS.open(target_file);
+  if (!f) {
+    error_logger("Error al abrir el archivo solicitado.");
+    return "null";
+  }
+
+  String file_string = f.readString();
+  f.close();
+
+  //log
+  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "data loaded from SPIFFS: %s", file_string.c_str());
+  return file_string;
+}
+
+// función que guarda una String en el target_file del SPIFFS.
+void save_data_in_fs(String data_to_save, const char *target_file) {
+  //savin data in filesystem.
+  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "saving in:%s this data:%s", target_file, data_to_save.c_str());
+
+  File f = SPIFFS.open(target_file, "w");
+  if (!f){
+    error_logger("Error al abrir el archivo solicitado.");
+    return;
+  }
+
+  f.print(data_to_save);
+  f.close();
+  info_logger("data saved correctly in SPIFFS.");
+  return;
+}
+
 //-functions
-bool is_valid_temp_value(float measurement) {
+bool temp_is_valid(float measurement) {
   char message_buffer[40];
   char name[8] = "ds18B20";
 
@@ -129,7 +161,7 @@ void update_temperatures()
     ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Return temperature: %3.2f °C", returnBuffer);
     float supplyBuffer = air_supply_sensor.getTempCByIndex(0);
     ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "Supply temperature: %3.2f °C", returnBuffer);
-    if (!is_valid_temp_value(returnBuffer) || !is_valid_temp_value(supplyBuffer))
+    if (!temp_is_valid(returnBuffer) || !temp_is_valid(supplyBuffer))
     {
       error_logger("invalid ds18b20 redings.");
       return;
@@ -162,11 +194,11 @@ bool str2mac(const char* mac, uint8_t* values){
 }
 
 //- load server mac address from filesystem.
-void load_server_address_from_fs() {
+void load_server_from_fs() {
   const char test_mac[] = "FF:AA:05:24:33:24";
   channel = 1; // channel also is stored in fs.
-  uint8_t mac_buffer[] = { 0 };
-  // fs string: "{server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
+  uint8_t mac_buffer[6] = { 0 };
+  // fs string: "{server_id: FFFFFFFFFFFF, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
   //-
   const bool parse_success = str2mac(test_mac, mac_buffer);
   if (parse_success) {
@@ -174,7 +206,7 @@ void load_server_address_from_fs() {
     mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
 
     //- update server_mac_address variable
-    memcpy(server_mac_address, mac_buffer, sizeof(uint8_t[6]));
+    memcpy(server_mac_address, mac_buffer, sizeof(mac_buffer));
 
   } else {
     error_logger("fail to load server mac address from file system.");
@@ -198,6 +230,7 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan){
   memcpy(server_mac_address, mac_addr, sizeof(uint8_t[6]));
 }
 
+//get device id from mac address.
 String get_device_id(const uint8_t * mac_addr) {
   char mac_str[18];
   snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
@@ -207,10 +240,20 @@ String get_device_id(const uint8_t * mac_addr) {
   return str;
 }
 
+// print mac address.
+String print_mac(const uint8_t * mac_addr) {
+  char mac_str[18];
+  snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  // return mac_str;
+  String str = (char*) mac_str;
+  return str;
+}
+
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
-  Serial.print("\r\nLast Packet Send Status:\t");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  info_logger("Last Packet Send Status:");
+  info_logger(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) { 
@@ -292,12 +335,12 @@ PairingStatus autoPairing(){
 
 // -setup
 void setup() {
-  // setup begin
+  // SETUP BEGIN
   esp_log_level_set("*", ESP_LOG_DEBUG); 
   Serial.begin(115200); 
-  //set all logger on debug.
   debug_logger("** setup start. **");
-  //pinout def
+
+  //PINS SETUP
   info_logger("pins settings");
   pinMode(AUTO_RELAY, OUTPUT);
   pinMode(VENT_RELAY, OUTPUT);
@@ -308,7 +351,14 @@ void setup() {
   pinMode(Q1_INPUT, INPUT_PULLUP);
   pinMode(NOW_CNF, INPUT);
   info_logger("pins settings done.");
-  // Inicio Sensores OneWire
+
+  // SPIFFS SETUP
+  if(!SPIFFS.begin(true)) {
+    error_logger("Ocurrió un error al iniciar SPIFFS., reboot.");
+    while (1) {;}
+  }
+
+  // OneWire SETUP
   info_logger("OneWire sensors settings!");
   air_return_sensor.begin();
   air_return_sensor.setResolution(tempSensorResolution);
@@ -322,22 +372,26 @@ void setup() {
   lastTempRequest = millis();
   tempRequestDelay = 750 / (1 << (12 - tempSensorResolution));
   info_logger("OneWire sensors settings done.");
-  //WiFi
+
+  //- WiFi SETUP
   info_logger("WiFi settings.");
   WiFi.mode(WIFI_AP);
   info_logger("MAC Address:  ->");
   info_logger(WiFi.macAddress().c_str());
   info_logger("WiFi settings done.");
-  //-esp now
+
+  //- ESP-NOW SETUP
   info_logger("esp-now settings");
-  uint8_t hubMacAddress[6];
-  esp_err_t ret = esp_wifi_get_mac(WIFI_IF_AP, hubMacAddress);
+  uint8_t mac_buffer[6];
+  esp_err_t ret = esp_wifi_get_mac(WIFI_IF_AP, mac_buffer);
   if (ret != ESP_OK) {
     error_logger("could not read mac address.");
   }
-  deviceID = get_device_id(hubMacAddress);
+  deviceID = get_device_id(mac_buffer);
+  //-
   if (esp_now_init() != ESP_OK) {
-    error_logger("error initializing esp now!");
+    error_logger("-- Error initializing ESP-NOW, please reboot --");
+    while (1){;}
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
@@ -345,6 +399,10 @@ void setup() {
   start = millis();
   pairingStatus = PAIR_REQUEST;
 
+  //LOAD DATA FROM FS
+  // load_server_from_fs();
+
+  // SETUP FINISHED
   info_logger("setup finished --!.");
 }  
 
