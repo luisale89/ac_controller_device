@@ -45,24 +45,28 @@ int channel = 1; // esp-now communication channel.
 String serverID = "";
 String deviceID = "";
 
-enum MessageType {PAIRING, DATA,};
 enum SenderID {SERVER, CONTROLLER, MONITOR,};
-enum SystemModes {SYS_OFF, SYS_FAN, SYS_COOL, SYS_AUTO_CL,};
 enum PairingStatus {NOT_PAIRED, PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, PAIR_IDLE};
+enum MessageTypeEnum {PAIRING, DATA,};
+enum SysModeEnum {AUTO_MODE, FAN_MODE, COOL_MODE};
+enum SysStateEnum {SYSTEM_ON, SYSTEM_OFF, SYSTEM_SLEEP, UNKN};
+enum PeerIDEnum {SERVER, CONTROLLER, MONITOR_A, MONITOR_B};
+//-vars
 PairingStatus pairingStatus = NOT_PAIRED;
-MessageType espnow_msg_type;
-SystemModes espnow_system_mode;
+MessageTypeEnum espnow_msg_type;
+SysModeEnum espnow_system_mode;
 SenderID espnow_peer_id;
 
 typedef struct controller_data_struct {
-  uint8_t msg_type;             // (1 byte)
-  uint8_t sender_id;            // (1 byte)
-  uint8_t active_system_mode;   // (1 byte)
-  uint8_t fault_code;           // (1 byte) 0-no_fault; 1..255 controller_fault_codes.
-  float evap_vapor_line_temp;   // (4 bytes)
-  float evap_air_in_temp;       // (4 bytes)
-  float evap_air_out_temp;      // (4 bytes)
-} controller_data_struct;       // TOTAL = 21 bytes
+  MessageTypeEnum msg_type;    // (1 byte)
+  PeerIDEnum sender_id;       // (1 byte)
+  uint8_t fault_code;      // (1 byte)
+  float air_return_temp;   // (4 bytes) [°C]
+  float air_supply_temp;   // (4 bytes) [°C]
+  bool drain_switch;       // (1 byte)
+  bool cooling_relay;      // (1 byte)
+  bool turbine_relay;      // (1 byte)
+} controller_data_struct;  // TOTAL = 14 bytes
 
 typedef struct incoming_settings_struct {
   uint8_t msg_type;             // (1 byte)
@@ -88,10 +92,11 @@ pairing_data_struct pairing_data;
 
 // time vars.
 unsigned long lastTempRequest = 0;
+unsigned long lastEspnowPost = 0;   // Stores last time temperature was published
+unsigned long lastPairingRequest = 0;
 unsigned long currentMillis = millis();
-unsigned long previousMillis = 0;   // Stores last time temperature was published
 unsigned long start;                // used to measure Pairing time
-const unsigned long interval = 5000;// Interval at which to publish sensor readings - 5' seconds
+const unsigned long espnowInterval = 5000;// Interval at which to publish sensor readings - 5' seconds
 
 //logger function
 void debug_logger(const char *message) {
@@ -298,7 +303,6 @@ void addPeer(const uint8_t * mac_addr, uint8_t chan){
     error_logger("esp peer could'n be added");
     return;
   }
-  memcpy(server_mac_address, mac_addr, sizeof(uint8_t[6]));
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -359,15 +363,15 @@ PairingStatus autoPairing(){
     // add peer and send request
     addPeer(server_mac_address, channel);
     esp_now_send(server_mac_address, (uint8_t *) &pairing_data, sizeof(pairing_data));
-    previousMillis = millis();
+    lastPairingRequest = millis();
     pairingStatus = PAIR_REQUESTED;
     break;
 
     case PAIR_REQUESTED:
     // time out to allow receiving response from server
     currentMillis = millis();
-    if(currentMillis - previousMillis > 1000) { // 1 second for server response.
-      previousMillis = currentMillis;
+    if(currentMillis - lastPairingRequest > 1000) { // 1 second for server response.
+      lastPairingRequest = currentMillis;
       // time out expired,  try next channel
       channel ++;
       if (channel > MAX_CHANNEL){
@@ -456,16 +460,24 @@ void setup() {
 }  
 
 void loop() {
+  //-
+  update_temperature_readings();
+  update_IO();
+  //- esp-now.
   if (autoPairing() == PAIR_PAIRED) {
     unsigned long currentMillis = millis();
-    if (currentMillis - previousMillis >= interval) {
+    if (currentMillis - lastEspnowPost >= espnowInterval) {
       // Save the last time a new reading was published
-      previousMillis = currentMillis;
+      lastEspnowPost = currentMillis;
       //Set values to send
       outgoing_data.msg_type = DATA;
-      outgoing_data.sender_id = BOARD_ID;
-      outgoing_data.evap_air_in_temp = air_return_temp;
-      outgoing_data.evap_air_out_temp = air_supply_temp;
+      outgoing_data.sender_id = CONTROLLER;
+      outgoing_data.fault_code = 0x16;
+      outgoing_data.air_return_temp = air_return_temp;
+      outgoing_data.air_supply_temp = air_supply_temp;
+      outgoing_data.drain_switch = true;
+      outgoing_data.cooling_relay = false;
+      outgoing_data.turbine_relay = false;
       esp_err_t result = esp_now_send(server_mac_address, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
     }
   }
