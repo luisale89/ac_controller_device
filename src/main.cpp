@@ -46,12 +46,12 @@ String server_serial = "";
 String self_serial = "";
 
 enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
-enum PairingStatus {NOT_PAIRED, PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, PAIR_IDLE};
+enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
 enum MessageTypeEnum {PAIRING, DATA,};
 enum SysModeEnum {AUTO_MODE, FAN_MODE, COOL_MODE};
 enum SysStateEnum {SYSTEM_ON, SYSTEM_OFF, SYSTEM_SLEEP, UNKN};
 //-vars
-PairingStatus pairingStatus = NOT_PAIRED;
+PairingStatusEnum pairingStatus = NOT_PAIRED;
 MessageTypeEnum espnow_msg_type;
 SysModeEnum espnow_system_mode;
 
@@ -93,7 +93,7 @@ unsigned long lastEspnowPost = 0;   // Stores last time temperature was publishe
 unsigned long lastPairingRequest = 0;
 unsigned long currentMillis = millis();
 unsigned long start;                // used to measure Pairing time
-const unsigned long espnowInterval = 5000;// Interval at which to publish sensor readings - 5' seconds
+const unsigned long espnowPostInterval = 5000;// Interval at which to publish sensor readings - 5' seconds
 
 //logger function
 void debug_logger(const char *message) {
@@ -171,13 +171,19 @@ String get_device_serial(const uint8_t * mac_addr) {
   return str;
 }
 
-void save_server_in_fs() {
+void save_server_in_fs(const uint8_t *new_mac_address) {
   //- save server info in spiffs.
-  info_logger("[esp-now] saving server data in fs.");
+  info_logger("[esp-now] saving new server data in the fs.");
   JsonDocument server_json;
   String data;
-  server_json["server_serial"] = get_device_serial(server_mac_address);
-  server_json["server_mac"] = print_mac(server_mac_address);
+  String new_server_serial = get_device_serial(new_mac_address);
+
+  //update global variables.
+  memcpy(server_mac_address, new_mac_address, sizeof(uint8_t[6]));
+  server_serial = new_server_serial;
+
+  server_json["server_serial"] = new_server_serial;
+  server_json["server_mac"] = print_mac(new_mac_address);
   server_json["server_chan"] = radio_channel;
 
   serializeJson(server_json, data);
@@ -277,8 +283,8 @@ void update_IO()
 }
 
 //- *esp_now functions
-void add_peer_to_plist(const uint8_t * mac_addr){
-  info_logger("adding new peer to peer list.");
+bool add_peer_to_plist(const uint8_t * mac_addr){
+  info_logger("[esp-now] adding new peer to peer list.");
   //-
   esp_now_peer_info_t peerTemplate;
   memset(&peerTemplate, 0, sizeof(esp_now_peer_info_t));
@@ -293,13 +299,13 @@ void add_peer_to_plist(const uint8_t * mac_addr){
   // check if the peer exists and remove it from peerlist
   if (esp_now_is_peer_exist(mac_addr)) {
     // Slave already paired.
-    info_logger("peer already exists, deleting existing data.");
+    info_logger("! peer already exists, deleting existing data.");
     esp_err_t deleteStatus = esp_now_del_peer(mac_addr);
     if (deleteStatus == ESP_OK) {
-      info_logger("peer deleted!");
+      info_logger("+ peer deleted!");
     } else {
-      error_logger("error deleting peer!");
-      return;
+      error_logger("* error deleting peer!");
+      return false;
     }
   }
   // save peer in peerlist
@@ -308,11 +314,11 @@ void add_peer_to_plist(const uint8_t * mac_addr){
   {
   case ESP_OK:
     info_logger("new peer added successfully");
-    return;
+    return true;
   
   default:
     ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "Error: %d, while adding new peer.", addPeerResult);
-    return;
+    return false;
   }
 }
 
@@ -339,14 +345,14 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
   //only accept messages from server device.
   if (strcmp(device_serial.c_str(), server_serial.c_str()) != 0) //don't match
   {
-    info_logger("invalid sender serial, only accepts messages from server device");
+    info_logger("[esp-now] msg from invalid device, receiving from server only.");
     return;
   }
 
   uint8_t message_type = incomingData[0];
   uint8_t device_id = incomingData[1];
   if (device_id != SERVER) {
-    info_logger("invalid device ID. ignoring message");
+    info_logger("[esp-now] invalid device ID. ignoring message");
     return;
   }
 
@@ -367,62 +373,91 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
 
   case PAIRING:    // received pairing data from server
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
-    add_peer_to_plist(mac_addr);  // add the server  to the peer list 
+    if (!add_peer_to_plist(mac_addr)){
+      error_logger("[esp-now] peer couldn't be saved, try again.");
+      break;
+    } 
+    
+    // add the server  to the peer list
+    save_server_in_fs(mac_addr); // update server info in fs.
+    
     // device PAIRED with server.
     pairingStatus = PAIR_PAIRED;  // set the pairing status
     break;
   }
 }
 
-PairingStatus autoPairing(){
+void espnow_loop(){
 
-  // if (strcmp(server_ser, "ffffffffffff") != 0) {
-  //   //- server address has never been set. configure idle mode for pairing process.
-  //   info_logger("server mac address has never been set.");
-  //   info_logger("Pairing status set to idle, waiting for ap button to begin pairing..");
-  //   pairingStatus = PAIR_IDLE;
-  // } else {
-  //   info_logger("ready to begin pairing requests..");
-  //   pairingStatus = PAIR_REQUEST;
-  // }
-
+  // switch modes.
   switch(pairingStatus) {
+    // PAIR REQUEST
     case PAIR_REQUEST:
     ESP_LOG_LEVEL(LOG_LOCAL_LEVEL, TAG, "Sending pairing request on channel: %d", radio_channel);
-    // set WiFi channel   
-    ESP_ERROR_CHECK(esp_wifi_set_channel(radio_channel,  WIFI_SECOND_CHAN_NONE));
   
     // set pairing data to send to the server
     pairing_data.msg_type = PAIRING;
-    pairing_data.sender_role = ROLE_UNSET;     
+    pairing_data.sender_role = ROLE_UNSET;
     pairing_data.channel = radio_channel;
 
     // add peer and send request
-    add_peer_to_plist(server_mac_address);
-    esp_now_send(server_mac_address, (uint8_t *) &pairing_data, sizeof(pairing_data));
+    if (!add_peer_to_plist(server_mac_address)){
+      error_logger("[esp-now] couldn't add peer to peer list.");
+      break;
+    }
+
+    //- send pair data.
+    esp_now_send(NULL, (uint8_t *) &pairing_data, sizeof(pairing_data));
     lastPairingRequest = millis();
     pairingStatus = PAIR_REQUESTED;
     break;
 
+    // PAIR REQUESTED
     case PAIR_REQUESTED:
     // time out to allow receiving response from server
     currentMillis = millis();
     if(currentMillis - lastPairingRequest > 1000) { // 1 second for server response.
       lastPairingRequest = currentMillis;
-      // time out expired,  try next channel
+      info_logger("[autopairing] time out expired, try next channel");
       radio_channel ++;
       if (radio_channel > MAX_CHANNEL){
          radio_channel = 1;
-      }   
+      }
+      // set WiFi channel   
+      ESP_ERROR_CHECK(esp_wifi_set_channel(radio_channel,  WIFI_SECOND_CHAN_NONE));
       pairingStatus = PAIR_REQUEST;
     }
     break;
 
-    case PAIR_PAIRED:
-      // nothing to do here 
+    // NOT PAIRED
+    case NOT_PAIRED:
+      // waiting for now button press to begin pair process. 
+      // starts with the default address (ffx6) and wait for the response
+      // to save the correct mac_address.
     break;
+    
+    // PAIRED
+    case PAIR_PAIRED:
+    //- posting data on posting intervals.
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastEspnowPost >= espnowPostInterval) {
+      // Save the last time a new reading was published
+      lastEspnowPost = currentMillis;
+      //Set values to send
+      outgoing_data.msg_type = DATA;
+      outgoing_data.sender_role = CONTROLLER;
+      outgoing_data.fault_code = 0x16;
+      outgoing_data.air_return_temp = air_return_temp;
+      outgoing_data.air_supply_temp = air_supply_temp;
+      outgoing_data.drain_switch = true;
+      outgoing_data.cooling_relay = false;
+      outgoing_data.turbine_relay = false;
+      esp_err_t result = esp_now_send(NULL, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
+    }
+    break;
+
   }
-  return pairingStatus;
+  return;
 }
 
 // -setup
@@ -489,33 +524,28 @@ void setup() {
   esp_now_register_recv_cb(OnDataRecv);
   //LOAD DATA FROM FS
   load_server_from_fs();
+
+  //- PAIRING SETUP
+  if (strcmp(server_serial.c_str(), "ffffffffffff") == 0) {
+    //- server address has never been set. configure idle mode for pairing process.
+    info_logger("[esp-now] server mac address is the default value, waiting for now button to pair");
+    pairingStatus = NOT_PAIRED;
+  } else {
+    info_logger("[esp-now] ready for esp-now communication with the server");
+    pairingStatus = PAIR_REQUEST;
+  }
+
+  //-done
   info_logger("[esp-now] settings done.");
 
   // SETUP FINISHED
   start = millis();
   info_logger("setup finished --!.");
-}  
+}
 
 void loop() {
   //-
   update_temperature_readings();
   update_IO();
-  //- esp-now.
-  if (autoPairing() == PAIR_PAIRED) {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastEspnowPost >= espnowInterval) {
-      // Save the last time a new reading was published
-      lastEspnowPost = currentMillis;
-      //Set values to send
-      outgoing_data.msg_type = DATA;
-      outgoing_data.sender_role = CONTROLLER;
-      outgoing_data.fault_code = 0x16;
-      outgoing_data.air_return_temp = air_return_temp;
-      outgoing_data.air_supply_temp = air_supply_temp;
-      outgoing_data.drain_switch = true;
-      outgoing_data.cooling_relay = false;
-      outgoing_data.turbine_relay = false;
-      esp_err_t result = esp_now_send(NULL, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
-    }
-  }
+  espnow_loop();
 }
