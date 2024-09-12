@@ -91,9 +91,11 @@ pairing_data_struct pairing_data;
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowPost = 0;   // Stores last time temperature was published
 unsigned long lastPairingRequest = 0;
-unsigned long currentMillis = millis();
-unsigned long start;                // used to measure Pairing time
+unsigned long currentMillis = 0;
+unsigned long lastNetworkLedBlink = 0;
+unsigned long start = 0;                // used to measure Pairing time
 const unsigned long espnowPostInterval = 5000;// Interval at which to publish sensor readings - 5' seconds
+const unsigned long espnowWaitPairResponse = 1000; // Interval to wait for pairing response from server
 
 //logger function
 void debug_logger(const char *message) {
@@ -388,49 +390,58 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
 }
 
 void espnow_loop(){
+  // current time.
+  currentMillis = millis();
 
   // switch modes.
   switch(pairingStatus) {
     // PAIR REQUEST
     case PAIR_REQUEST:
-    ESP_LOG_LEVEL(LOG_LOCAL_LEVEL, TAG, "Sending pairing request on channel: %d", radio_channel);
-  
-    // set pairing data to send to the server
-    pairing_data.msg_type = PAIRING;
-    pairing_data.sender_role = ROLE_UNSET;
-    pairing_data.channel = radio_channel;
+      ESP_LOG_LEVEL(LOG_LOCAL_LEVEL, TAG, "Sending pairing request on channel: %d", radio_channel);
+    
+      // set pairing data to send to the server
+      pairing_data.msg_type = PAIRING;
+      pairing_data.sender_role = ROLE_UNSET;
+      pairing_data.channel = radio_channel;
 
-    // add peer and send request
-    if (!add_peer_to_plist(server_mac_address)){
-      error_logger("[esp-now] couldn't add peer to peer list.");
-      break;
-    }
+      // add peer and send request
+      if (!add_peer_to_plist(server_mac_address)){
+        error_logger("[esp-now] couldn't add peer to peer list.");
+        break;
+      }
 
-    //- send pair data.
-    esp_now_send(NULL, (uint8_t *) &pairing_data, sizeof(pairing_data));
-    lastPairingRequest = millis();
-    pairingStatus = PAIR_REQUESTED;
+      //- send pair data.
+      esp_now_send(NULL, (uint8_t *) &pairing_data, sizeof(pairing_data));
+      lastPairingRequest = millis();
+      pairingStatus = PAIR_REQUESTED;
     break;
 
     // PAIR REQUESTED
     case PAIR_REQUESTED:
-    // time out to allow receiving response from server
-    currentMillis = millis();
-    if(currentMillis - lastPairingRequest > 1000) { // 1 second for server response.
-      lastPairingRequest = currentMillis;
-      info_logger("[autopairing] time out expired, try next channel");
-      radio_channel ++;
-      if (radio_channel > MAX_CHANNEL){
-         radio_channel = 1;
+      const unsigned long blinkInterval = 250;
+      // led blink.
+      if (currentMillis - lastNetworkLedBlink > blinkInterval) {
+        lastNetworkLedBlink = currentMillis;
+        digitalWrite(NETWORK_LED, !digitalRead(NETWORK_LED));
       }
-      // set WiFi channel   
-      ESP_ERROR_CHECK(esp_wifi_set_channel(radio_channel,  WIFI_SECOND_CHAN_NONE));
-      pairingStatus = PAIR_REQUEST;
-    }
+
+      // time out to allow receiving response from server
+      if(currentMillis - lastPairingRequest > espnowWaitPairResponse) {
+        lastPairingRequest = currentMillis;
+        info_logger("[autopairing] time out expired, try next channel");
+        radio_channel ++;
+        if (radio_channel > MAX_CHANNEL){
+          radio_channel = 1;
+        }
+        // set WiFi channel   
+        ESP_ERROR_CHECK(esp_wifi_set_channel(radio_channel,  WIFI_SECOND_CHAN_NONE));
+        pairingStatus = PAIR_REQUEST;
+      }
     break;
 
     // NOT PAIRED
     case NOT_PAIRED:
+      digitalWrite(NETWORK_LED, LOW); // turn off.
       // waiting for now button press to begin pair process. 
       // starts with the default address (ffx6) and wait for the response
       // to save the correct mac_address.
@@ -438,25 +449,27 @@ void espnow_loop(){
     
     // PAIRED
     case PAIR_PAIRED:
-    //- posting data on posting intervals.
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastEspnowPost >= espnowPostInterval) {
-      // Save the last time a new reading was published
-      lastEspnowPost = currentMillis;
-      //Set values to send
-      outgoing_data.msg_type = DATA;
-      outgoing_data.sender_role = CONTROLLER;
-      outgoing_data.fault_code = 0x16;
-      outgoing_data.air_return_temp = air_return_temp;
-      outgoing_data.air_supply_temp = air_supply_temp;
-      outgoing_data.drain_switch = true;
-      outgoing_data.cooling_relay = false;
-      outgoing_data.turbine_relay = false;
-      esp_err_t result = esp_now_send(NULL, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
-    }
+      //- posting data on posting intervals.
+      digitalWrite(NETWORK_LED, HIGH); // solid light.
+      //-
+      if (currentMillis - lastEspnowPost >= espnowPostInterval) {
+        // Save the last time a new reading was published
+        lastEspnowPost = currentMillis;
+        //Set values to send
+        outgoing_data.msg_type = DATA;
+        outgoing_data.sender_role = CONTROLLER;
+        outgoing_data.fault_code = 0x16;
+        outgoing_data.air_return_temp = air_return_temp;
+        outgoing_data.air_supply_temp = air_supply_temp;
+        outgoing_data.drain_switch = true;
+        outgoing_data.cooling_relay = false;
+        outgoing_data.turbine_relay = false;
+        esp_err_t result = esp_now_send(NULL, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
+      }
     break;
-
   }
+
+  //-end
   return;
 }
 
