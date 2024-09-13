@@ -40,10 +40,10 @@ float air_return_temp = 0;
 float air_supply_temp = 0;
 
 // esp-now variables
-uint8_t server_mac_address[] = { 0 };
+uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 int radio_channel = 1; // esp-now communication channel.
-String server_serial = "";
-String self_serial = "";
+int pair_request_attempts = 0;
+const int max_pair_attempts = 66; // 6 times on each channel.
 
 enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
 enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
@@ -93,9 +93,16 @@ unsigned long lastEspnowPost = 0;   // Stores last time temperature was publishe
 unsigned long lastPairingRequest = 0;
 unsigned long currentMillis = 0;
 unsigned long lastNetworkLedBlink = 0;
-unsigned long start = 0;                // used to measure Pairing time
-const unsigned long espnowPostInterval = 5000;// Interval at which to publish sensor readings - 5' seconds
+unsigned long lastNowBtnChange = 0;
+const unsigned long espnowPostInterval = 10000;// Interval at which to publish sensor readings - 10' seconds
 const unsigned long espnowWaitPairResponse = 1000; // Interval to wait for pairing response from server
+const unsigned long debounceTime = 75; // 50ms rebound time constant;
+
+// gen vars
+bool now_btn_state = false;
+bool last_now_btn_state = false;
+bool float_sw_state = false;
+bool last_float_sw_state = false;
 
 //logger function
 void debug_logger(const char *message) {
@@ -121,6 +128,7 @@ String load_data_from_fs(const char *target_file) {
 
   String file_string = f.readString();
   f.close();
+  delay(100);
 
   //log
   ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "data loaded from SPIFFS: %s", file_string.c_str());
@@ -141,6 +149,8 @@ void save_data_in_fs(String data_to_save, const char *target_file) {
   f.print(data_to_save);
   f.close();
   info_logger("data saved correctly in SPIFFS.");
+  delay(100);
+
   return;
 }
 
@@ -154,17 +164,8 @@ String print_mac(const uint8_t * mac_addr) {
   return str;
 }
 
-//- mac address parser
-bool str2mac(const char* mac, uint8_t* values){
-    if(6 == sscanf(mac,"%02x:%02x:%02x:%02x:%02x:%02x",&values[0], &values[1], &values[2],&values[3], &values[4], &values[5])){
-        return true;
-    }else{
-        return false;
-    }
-}
-
 //get device id from mac address.
-String get_device_serial(const uint8_t * mac_addr) {
+String print_device_serial(const uint8_t * mac_addr) {
   char mac_str[18];
   snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
@@ -173,33 +174,56 @@ String get_device_serial(const uint8_t * mac_addr) {
   return str;
 }
 
+//- mac address parser
+void parse_mac_address(const char* str, char sep, byte* bytes, int maxBytes, int base) {
+    for (int i = 0; i < maxBytes; i++) {
+        bytes[i] = strtoul(str, NULL, base);  // Convert byte
+        str = strchr(str, sep);               // Find next separator
+        if (str == NULL || *str == '\0') {
+            break;                            // No more separators, exit
+        }
+        str++;                                // Point to next character after separator
+    }
+}
+
 void save_server_in_fs(const uint8_t *new_mac_address) {
   //- save server info in spiffs.
+  // SPIFFS SETUP
+  if(!SPIFFS.begin(true)) {
+    error_logger("Ocurrió un error al iniciar SPIFFS..");
+    return;
+  }
+
   info_logger("[esp-now] saving new server data in the fs.");
   JsonDocument server_json;
   String data;
-  String new_server_serial = get_device_serial(new_mac_address);
+  String new_server_serial = print_device_serial(new_mac_address);
 
   //update global variables.
-  memcpy(server_mac_address, new_mac_address, sizeof(uint8_t[6]));
-  server_serial = new_server_serial;
-
+  memcpy(server_mac_address, new_mac_address, sizeof(server_mac_address));
+  // create json
   server_json["server_serial"] = new_server_serial;
   server_json["server_mac"] = print_mac(new_mac_address);
   server_json["server_chan"] = radio_channel;
-
+  //save json in filesystem.
   serializeJson(server_json, data);
-  save_data_in_fs(data, "now_server.txt");
+  save_data_in_fs(data, "/now_server.txt");
 
   return;
 }
 
-
 //- load server mac address from filesystem.
 void load_server_from_fs() {
   info_logger("[esp-now] loading server data from fs.");
+
+    // SPIFFS SETUP
+  if(!SPIFFS.begin(true)) {
+    error_logger("Ocurrió un error al iniciar SPIFFS..");
+    return;
+  }
+
   JsonDocument server_json;
-  String server_data = load_data_from_fs("now_server.txt");
+  String server_data = load_data_from_fs("/now_server.txt");
   DeserializationError error = deserializeJson(server_json, server_data);
 
   if (error)
@@ -209,33 +233,24 @@ void load_server_from_fs() {
   }
 
   const char *server_ser = server_json["server_serial"] | "null";
-  const char *server_mac = server_json["server_mac"] | "null";
-  const int server_chan = server_json["server_chan"] | 1;
+  const char *server_mac_str = server_json["server_mac"] | "null";
+  radio_channel = server_json["server_chan"] | 1;
 
   if (strcmp(server_ser, "null") == 0) {
     error_logger("server id not found in fs.");
     return;
   }
-  if (strcmp(server_mac, "null") == 0) {
+  if (strcmp(server_mac_str, "null") == 0) {
     error_logger("server mac addres not found in fs.");
     return;
   }
 
-  uint8_t mac_buffer[6] = { 0 };
+  uint8_t mac_buffer[6];
   // fs string: "{server_id: ffffffffffff, server_mac: FF:FF:FF:FF:FF:FF, server_chan: 1}"
   //-
-  if (str2mac(server_mac, mac_buffer)) {
-    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Server Mac Address: %02X:%02X:%02X:%02X:%02X:%02X", 
-    mac_buffer[0], mac_buffer[1], mac_buffer[2], mac_buffer[3], mac_buffer[4], mac_buffer[5]);
-
-    //- update server variables.
-    memcpy(server_mac_address, mac_buffer, sizeof(mac_buffer));
-    server_serial = (char*) server_ser;
-    radio_channel = server_chan;
-
-  } else {
-    error_logger("fail to parse server mac address from file system.");
-  }
+  parse_mac_address(server_mac_str, ':', mac_buffer, 6, 16);
+  info_logger("mac address parsed: ");
+  info_logger(print_mac(mac_buffer).c_str());
 
   return;
 }
@@ -280,6 +295,21 @@ void update_temperature_readings()
 
 void update_IO()
 {
+  currentMillis = millis();
+  //inputs
+  const bool current_now_btn = digitalRead(NOW_CNF) ? false : true; //button is active low.
+  const bool current_float_switch = digitalRead(FLOAT_SWTCH) ? false : true; // float switch is active low.
+
+  if (current_now_btn != last_now_btn_state) {
+    lastNowBtnChange = currentMillis;
+    last_now_btn_state = current_now_btn;
+  }
+
+  if (currentMillis - lastNowBtnChange > debounceTime) {
+    // btn change.
+    now_btn_state = current_now_btn;
+  }
+  //outputs
   // to-do: function tu update inputs and outputs.
   return;
 }
@@ -289,20 +319,20 @@ bool add_peer_to_plist(const uint8_t * mac_addr){
   info_logger("[esp-now] adding new peer to peer list.");
   //-
   esp_now_peer_info_t peerTemplate;
-  memset(&peerTemplate, 0, sizeof(esp_now_peer_info_t));
+  memset(&peerTemplate, 0, sizeof(peerTemplate));
   //create reference to peerTemplate memory loc.
   const esp_now_peer_info_t *peer = &peerTemplate;
 
   //-set data
-  memcpy(peerTemplate.peer_addr, mac_addr, sizeof(uint8_t[6]));
+  memcpy(peerTemplate.peer_addr, server_mac_address, sizeof(server_mac_address));
   peerTemplate.channel = radio_channel;
   peerTemplate.encrypt = false;
 
   // check if the peer exists and remove it from peerlist
-  if (esp_now_is_peer_exist(mac_addr)) {
+  if (esp_now_is_peer_exist(server_mac_address)) {
     // Slave already paired.
     info_logger("! peer already exists, deleting existing data.");
-    esp_err_t deleteStatus = esp_now_del_peer(mac_addr);
+    esp_err_t deleteStatus = esp_now_del_peer(server_mac_address);
     if (deleteStatus == ESP_OK) {
       info_logger("+ peer deleted!");
     } else {
@@ -326,7 +356,7 @@ bool add_peer_to_plist(const uint8_t * mac_addr){
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   //- callback.
-  String device_id = get_device_serial(mac_addr);
+  String device_id = print_device_serial(mac_addr);
   switch (status)
   {
   case ESP_NOW_SEND_SUCCESS:
@@ -341,11 +371,11 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) { 
   //-
-  String device_serial = get_device_serial(mac_addr);
+  String device_serial = print_device_serial(mac_addr);
   ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "[esp-now] %d bytes of data received from: %s", len, device_serial.c_str());
 
   //only accept messages from server device.
-  if (strcmp(device_serial.c_str(), server_serial.c_str()) != 0) //don't match
+  if (strcmp(device_serial.c_str(), print_device_serial(mac_addr).c_str()) != 0) //don't match
   {
     info_logger("[esp-now] msg from invalid device, receiving from server only.");
     return;
@@ -384,7 +414,12 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
     save_server_in_fs(mac_addr); // update server info in fs.
     
     // device PAIRED with server.
+    char buff[100] = "";
+    sprintf(buff, "device paired on channel %d after %d attempts", radio_channel, pair_request_attempts);
+    info_logger(buff);
+    pair_request_attempts = 0;
     pairingStatus = PAIR_PAIRED;  // set the pairing status
+    //-
     break;
   }
 }
@@ -397,6 +432,17 @@ void espnow_loop(){
   switch(pairingStatus) {
     // PAIR REQUEST
     case PAIR_REQUEST:
+      // check if no more attemps are allowed.
+      pair_request_attempts ++;
+      if (strcmp("ffffffffffff", print_device_serial(server_mac_address).c_str()) == 0)
+      {
+        if (pair_request_attempts > max_pair_attempts) {
+          // ends pairing process.
+          pairingStatus = NOT_PAIRED;
+          break;
+        }
+      }
+
       ESP_LOG_LEVEL(LOG_LOCAL_LEVEL, TAG, "Sending pairing request on channel: %d", radio_channel);
     
       // set pairing data to send to the server
@@ -411,16 +457,15 @@ void espnow_loop(){
       }
 
       //- send pair data.
-      esp_now_send(NULL, (uint8_t *) &pairing_data, sizeof(pairing_data));
+      esp_now_send(server_mac_address, (uint8_t *) &pairing_data, sizeof(pairing_data));
       lastPairingRequest = millis();
       pairingStatus = PAIR_REQUESTED;
     break;
 
     // PAIR REQUESTED
     case PAIR_REQUESTED:
-      const unsigned long blinkInterval = 250;
-      // led blink.
-      if (currentMillis - lastNetworkLedBlink > blinkInterval) {
+      // change wifi channel for continue with the pairing process.
+      if (currentMillis - lastNetworkLedBlink > 250L) { // 4hz blink
         lastNetworkLedBlink = currentMillis;
         digitalWrite(NETWORK_LED, !digitalRead(NETWORK_LED));
       }
@@ -436,12 +481,17 @@ void espnow_loop(){
         // set WiFi channel   
         ESP_ERROR_CHECK(esp_wifi_set_channel(radio_channel,  WIFI_SECOND_CHAN_NONE));
         pairingStatus = PAIR_REQUEST;
+
       }
     break;
 
     // NOT PAIRED
     case NOT_PAIRED:
       digitalWrite(NETWORK_LED, LOW); // turn off.
+      if (now_btn_state && currentMillis - lastNowBtnChange > 3000L) {
+        // after 3 seconds of now button pressed..
+        pairingStatus = PAIR_REQUEST; // begin pair process.
+      }
       // waiting for now button press to begin pair process. 
       // starts with the default address (ffx6) and wait for the response
       // to save the correct mac_address.
@@ -464,7 +514,8 @@ void espnow_loop(){
         outgoing_data.drain_switch = true;
         outgoing_data.cooling_relay = false;
         outgoing_data.turbine_relay = false;
-        esp_err_t result = esp_now_send(NULL, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
+        esp_err_t result = esp_now_send(server_mac_address, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
+
       }
     break;
   }
@@ -491,12 +542,6 @@ void setup() {
   pinMode(Q1_INPUT, INPUT_PULLUP);
   pinMode(NOW_CNF, INPUT);
   info_logger("pins settings done.");
-
-  // SPIFFS SETUP
-  if(!SPIFFS.begin(true)) {
-    error_logger("Ocurrió un error al iniciar SPIFFS., reboot.");
-    while (1) {;}
-  }
 
   // OneWire SETUP
   info_logger("OneWire sensors settings!");
@@ -527,7 +572,6 @@ void setup() {
   if (ret != ESP_OK) {
     error_logger("could not read mac address.");
   }
-  self_serial = get_device_serial(mac_buffer);
   //-
   if (esp_now_init() != ESP_OK) {
     error_logger("-- Error initializing ESP-NOW, please reboot --");
@@ -535,24 +579,23 @@ void setup() {
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
+
+  //-done
+  info_logger("[esp-now] settings done.");
+
   //LOAD DATA FROM FS
   load_server_from_fs();
-
   //- PAIRING SETUP
-  if (strcmp(server_serial.c_str(), "ffffffffffff") == 0) {
+  if (strcmp(print_device_serial(server_mac_address).c_str(), "ffffffffffff") == 0) {
     //- server address has never been set. configure idle mode for pairing process.
-    info_logger("[esp-now] server mac address is the default value, waiting for now button to pair");
+    info_logger("[esp-now] server mac address is the default value.");
     pairingStatus = NOT_PAIRED;
   } else {
     info_logger("[esp-now] ready for esp-now communication with the server");
     pairingStatus = PAIR_REQUEST;
   }
 
-  //-done
-  info_logger("[esp-now] settings done.");
-
   // SETUP FINISHED
-  start = millis();
   info_logger("setup finished --!.");
 }
 
