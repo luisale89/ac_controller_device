@@ -40,12 +40,12 @@ float air_return_temp = 0;
 float air_supply_temp = 0;
 
 // esp-now variables
-uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-esp_now_peer_info_t server_peer;
+esp_now_peer_info_t server_peer; // variable holds the data for esp-now communications.
+const int MAX_PAIR_ATTEMPTS = 66; // 6 times on each channel.
 const char SERIAL_DEFAULT[] = "ffffffffffff";
+uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 int radio_channel = 1; // esp-now communication channel.
 int pair_request_attempts = 0;
-const int MAX_PAIR_ATTEMPTS = 66; // 6 times on each channel.
 
 enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
 enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
@@ -215,7 +215,6 @@ void load_server_from_fs() {
   JsonDocument server_json;
   String server_data = load_data_from_fs("/now_server.txt");
   DeserializationError error = deserializeJson(server_json, server_data);
-
   if (error)
   {
     ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "server_json Deserialization error raised with code: %s", error.c_str());
@@ -224,12 +223,12 @@ void load_server_from_fs() {
 
   const char *server_ser = server_json["server_serial"] | "null";
   const char *server_mac_str = server_json["server_mac"] | "null";
-  radio_channel = server_json["server_chan"] | 1;
+  uint8_t server_channel = server_json["server_chan"] | 1;
 
   //- validations.
   if (radio_channel < 1 || radio_channel > MAX_CHANNEL) {
     error_logger("Invalid Wifi channel stored in fs. setting channel to default value.");
-    radio_channel = 1;
+    server_channel = 1;
   }
 
   if (strcmp(server_ser, "null") == 0) {
@@ -241,13 +240,19 @@ void load_server_from_fs() {
     return;
   }
 
-  //-
-  uint8_t mac_buffer[6];
-  parse_mac_address(server_mac_str, ':', mac_buffer, 6, 16);
-  //- update server_mac_address variable.
-  memcpy(server_mac_address, mac_buffer, sizeof(uint8_t[6]));
+  //reset server_peer variable.
+  memset(&server_peer, 0, sizeof(esp_now_peer_info_t));
 
-  //- PAIRING SETUP
+  //-
+  parse_mac_address(server_mac_str, ':', server_mac_address, 6, 16);
+
+  //- update server_peer variable.
+  memcpy(&server_peer.peer_addr, server_mac_address, sizeof(uint8_t[6]));
+  server_peer.encrypt = false;
+  server_peer.channel = server_channel;
+  radio_channel = server_channel;
+
+  //- Set pairingStatus based on the server_serial loaded from fs.
   if (strcmp(server_ser, SERIAL_DEFAULT) == 0) {
     //- server address has never been set. configure idle mode for pairing process.
     info_logger("[esp-now] server mac address is the default value.");
@@ -256,7 +261,6 @@ void load_server_from_fs() {
     info_logger("[esp-now] ready for esp-now communication with the server");
     pairingStatus = PAIR_REQUEST;
   }
-
 
   info_logger("server data loaded from fs!");
   return;
@@ -324,17 +328,13 @@ void update_IO()
 //- *esp_now functions
 bool add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   info_logger("[esp-now] adding new peer to peer list.");
+  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "MAC: %s, channel: %d.", print_device_mac(mac_addr).c_str(), channel);
   //- set to 0 all data of the peerTemplate var.
   memset(&server_peer, 0, sizeof(esp_now_peer_info_t));
-  //create reference to peerTemplate memory loc.
-  
-  //- update WiFi channel.
-  ESP_ERROR_CHECK(esp_wifi_set_channel(channel,  WIFI_SECOND_CHAN_NONE));
 
   //-set data
   //update global variable.
-  memcpy(server_mac_address, mac_addr, sizeof(server_mac_address));
-  memcpy(server_peer.peer_addr, mac_addr, sizeof(mac_addr));
+  memcpy(&server_peer.peer_addr, mac_addr, sizeof(uint8_t[6]));
   server_peer.channel = channel;
   server_peer.encrypt = false;
 
@@ -345,7 +345,11 @@ bool add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   }
   // save peer in peerlist
   esp_err_t result = esp_now_add_peer(&server_peer);
-  
+
+  //- update WiFi channel.
+  ESP_ERROR_CHECK(esp_wifi_set_channel(channel,  WIFI_SECOND_CHAN_NONE));
+  info_logger("WiFi channel updated!");
+
   switch (result)
   {
   case ESP_OK:
@@ -404,7 +408,7 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
   case PAIRING:    // received pairing data from server
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
     // add peer to peer list.
-    if (!add_peer_to_plist(mac_addr, pairing_data.channel)){
+    if (!add_peer_to_plist(mac_addr, pairing_data.channel)){ // the server decides the channel.
       error_logger("[esp-now] server peer couldn't be saved, try again.");
       break;
     }
