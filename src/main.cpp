@@ -115,7 +115,7 @@ void network_led_pulse_effect() {
   // pulse effect.
   analogWrite(NETWORK_LED, led_brightness);
   led_brightness = led_brightness + led_fade_amount;
-  if (led_brightness <= 0 || led_brightness >= 255) {
+  if (led_brightness <= 0 || led_brightness >= 125) {
     led_fade_amount = -led_fade_amount;
   }
 }
@@ -491,12 +491,8 @@ void espnow_loop(){
     set_defaults_in_fs();
     //-
     info_logger("ESP restart...");
-    for (int i=0; i<2 ;i++) {
-      digitalWrite(NETWORK_LED, HIGH);
-      delay(250);
-      digitalWrite(NETWORK_LED, LOW);
-      delay(250);
-    }
+    digitalWrite(NETWORK_LED, HIGH);
+    delay(1000);
     ESP.restart();
   }
 
