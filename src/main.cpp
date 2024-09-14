@@ -42,10 +42,12 @@ float air_supply_temp = 0;
 // esp-now variables
 esp_now_peer_info_t server_peer; // variable holds the data for esp-now communications.
 const int MAX_PAIR_ATTEMPTS = 66; // 6 times on each channel.
+const int MAX_PACKET_FAILS = 18; // 18 times for begin pair process again. check if the server changed channel.
 const char SERIAL_DEFAULT[] = "ffffffffffff";
 uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 int radio_channel = 1; // esp-now communication channel.
 int pair_request_attempts = 0;
+int packet_fails_number = 0;
 
 enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
 enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
@@ -105,6 +107,18 @@ bool now_btn_state = false;
 bool last_now_btn_state = false;
 bool float_sw_state = false;
 bool last_float_sw_state = false;
+int led_brightness = 0;
+int led_fade_amount = 5;
+
+//-
+void network_led_pulse_effect() {
+  // pulse effect.
+  analogWrite(NETWORK_LED, led_brightness);
+  led_brightness = led_brightness + led_fade_amount;
+  if (led_brightness <= 0 || led_brightness >= 255) {
+    led_fade_amount = -led_fade_amount;
+  }
+}
 
 //logger function
 void debug_logger(const char *message) {
@@ -188,6 +202,23 @@ void parse_mac_address(const char* str, char sep, byte* bytes, int maxBytes, int
         }
         str++;                                // Point to next character after separator
     }
+}
+
+void set_defaults_in_fs(){
+  info_logger("saving server default values in the fs.");
+  JsonDocument json_doc;
+  String data;
+
+  //create json_doc
+  json_doc["server_serial"] = "ffffffffffff";
+  json_doc["server_mac"] = "FF:FF:FF:FF:FF:FF";
+  json_doc["server_chan"] = 1;
+
+  serializeJson(json_doc, data);
+  save_data_in_fs(data, "/now_server.txt");
+
+  return;
+
 }
 
 void save_server_in_fs(const uint8_t *new_mac_address, uint8_t new_channel) {
@@ -369,10 +400,16 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   {
   case ESP_NOW_SEND_SUCCESS:
     ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "[esp-now] packet to: %s has been sent!", device_id.c_str());
+    packet_fails_number = 0;
     break;
   
   default:
-  ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] packet to: %s not sent.", device_id.c_str());
+    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] packet to: %s not sent.", device_id.c_str());
+    packet_fails_number ++;
+    if (packet_fails_number > MAX_PACKET_FAILS) {
+      info_logger("max delivery failure number, starting Pairing Request.");
+      pairingStatus = PAIR_REQUEST;
+    }
     break;
   }
 }
@@ -435,7 +472,7 @@ void log_on_result(esp_err_t result) {
     break;
   
   default:
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] error sending pairing msg to peer, reason: %s",  esp_err_to_name(result));
+    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] error sending msg to peer, reason: %s",  esp_err_to_name(result));
     break;
   }
 
@@ -446,6 +483,22 @@ void espnow_loop(){
   // current time.
   currentMillis = millis();
   esp_err_t send_result;
+
+  if (now_btn_state && currentMillis - lastNowBtnChange > 10000L) {
+    // after 10 seconds of now button pressed, default values will be set.
+    lastNowBtnChange = millis();
+    //-
+    set_defaults_in_fs();
+    //-
+    info_logger("ESP restart...");
+    for (int i=0; i<2 ;i++) {
+      digitalWrite(NETWORK_LED, HIGH);
+      delay(250);
+      digitalWrite(NETWORK_LED, LOW);
+      delay(250);
+    }
+    ESP.restart();
+  }
 
   // switch modes.
   switch(pairingStatus) {
@@ -487,7 +540,7 @@ void espnow_loop(){
     // PAIR REQUESTED
     case PAIR_REQUESTED:
       // change wifi channel for continue with the pairing process.
-      if (currentMillis - lastNetworkLedBlink > 250L) { // 2hz blink
+      if (currentMillis - lastNetworkLedBlink > 125L) { // 4hz blink
         lastNetworkLedBlink = currentMillis;
         digitalWrite(NETWORK_LED, !digitalRead(NETWORK_LED));
       }
@@ -508,7 +561,10 @@ void espnow_loop(){
 
     // NOT PAIRED
     case NOT_PAIRED:
-      digitalWrite(NETWORK_LED, LOW); // turn off.
+      if (currentMillis - lastNetworkLedBlink > 500L) { // 1hz blink
+        lastNetworkLedBlink = currentMillis;
+        digitalWrite(NETWORK_LED, !digitalRead(NETWORK_LED));
+      }
       if (now_btn_state && currentMillis - lastNowBtnChange > 3000L) {
         // after 3 seconds of now button pressed..
         pairingStatus = PAIR_REQUEST; // begin pair process.
@@ -521,7 +577,10 @@ void espnow_loop(){
     // PAIRED
     case PAIR_PAIRED:
       //- posting data on posting intervals.
-      digitalWrite(NETWORK_LED, HIGH); // solid light.
+      if (currentMillis - lastNetworkLedBlink > 50L) {
+        lastNetworkLedBlink = currentMillis;
+        network_led_pulse_effect();
+      }
       //-
       if (currentMillis - lastEspnowPost >= ESP_NOW_POST_INTERVAL) {
         // Save the last time a new reading was published
@@ -616,6 +675,7 @@ void setup() {
 
   // SETUP FINISHED
   info_logger("setup finished --!.");
+  delay(500);
 }
 
 void loop() {
