@@ -103,7 +103,7 @@ const unsigned long SYSTEM_LOG_DELAY = 1000L; // 1 second.
 const unsigned long FAN_OFF_DELAY = 5000L; // 5 seconds delay.
 const unsigned long COMPRESSOR_ON_DELAY = 2L * 60000L; // 2 minutes for compressor turn on.
 const unsigned long ESP_NOW_POST_INTERVAL = 500; // 0,5 seconds after receiving data from the server.
-const unsigned long ESP_NOW_WAIT_SERVER_MSG = 5L * 60000L; // 5 minutes for server message to arrive before PAIRING mode set.
+const unsigned long ESP_NOW_WAIT_SERVER_MSG = 1L * 60000L; // 1 minute for server message to arrive before PAIRING mode is set.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000; // Interval to wait for pairing response from server
 const unsigned long BTN_DEBOUNCE_TIME = 75; // 50ms rebound time constant;
 
@@ -433,6 +433,7 @@ void update_IO()
   case SYSTEM_SLEEP:
     set_compressor_state(false);
     set_fan_state(false);
+    break;
 
   case SYSTEM_ON:
     // system is on.
@@ -479,8 +480,8 @@ void update_IO()
       return;
     }
 
+    //-breaks;
     break;
-
   }
 
   return;
