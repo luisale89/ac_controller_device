@@ -465,6 +465,8 @@ void update_IO()
       if (air_return_temp > on_value) {
         set_compressor_state(true);
       }
+
+      return;
     }
 
     if (settings_data.system_mode == AUTO_MODE) {
