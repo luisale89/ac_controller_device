@@ -41,13 +41,14 @@ float air_supply_temp = 0;
 
 // esp-now variables
 esp_now_peer_info_t server_peer; // variable holds the data for esp-now communications.
-const int MAX_PAIR_ATTEMPTS = 66; // 6 times on each channel.
+const int MAX_PAIR_ATTEMPTS = 55; // 5 times on each channel.
 const int MAX_PACKET_FAILS = 18; // 18 times for begin pair process again. check if the server changed channel.
 const char SERIAL_DEFAULT[] = "ffffffffffff";
 uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 int radio_channel = 1; // esp-now communication channel.
 int pair_request_attempts = 0;
-int packet_fails_number = 0;
+int packet_fails_count = 0;
+bool postEspnowFlag = false;
 
 enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
 enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
@@ -88,17 +89,19 @@ typedef struct pairing_data_struct {
 
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
-incoming_settings_struct incoming_data;  // data received from server
+incoming_settings_struct settings_data;  // data received from server
 pairing_data_struct pairing_data;
 
 // time vars.
 unsigned long lastTempRequest = 0;
-unsigned long lastEspnowPost = 0;   // Stores last time temperature was published
+unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
 unsigned long currentMillis = 0;
 unsigned long lastNetworkLedBlink = 0;
 unsigned long lastNowBtnChange = 0;
-const unsigned long ESP_NOW_POST_INTERVAL = 10000;// Interval at which to publish sensor readings - 10' seconds
+unsigned long lastCompressorTurnOn = 0;
+const unsigned long COMPRESSOR_DELAY = 2L * 60000L; // 2 minutes for compressor turn on.
+const unsigned long ESP_NOW_POST_INTERVAL = 1000; // 1 second after receiving data from the server.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000; // Interval to wait for pairing response from server
 const unsigned long BTN_DEBOUNCE_TIME = 75; // 50ms rebound time constant;
 
@@ -109,6 +112,10 @@ bool float_sw_state = false;
 bool last_float_sw_state = false;
 int led_brightness = 0;
 int led_fade_amount = 5;
+//output states.
+bool compressor_state = false;
+bool fan_state = false;
+bool autocl_state = false;
 
 //-
 void network_led_pulse_effect() {
@@ -351,6 +358,7 @@ void update_IO()
     // btn change.
     now_btn_state = current_now_btn;
   }
+
   //outputs
   // to-do: function tu update inputs and outputs.
   return;
@@ -359,6 +367,12 @@ void update_IO()
 //- *esp_now functions
 bool add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   info_logger("[esp-now] adding new peer to peer list.");
+
+  if (channel <= 0 || channel > MAX_CHANNEL) {
+    error_logger("invalid channel value received. peer not added");
+    return false;
+  }
+
   ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "MAC: %s, channel: %d.", print_device_mac(mac_addr).c_str(), channel);
   //- set to 0 all data of the peerTemplate var.
   memset(&server_peer, 0, sizeof(esp_now_peer_info_t));
@@ -400,16 +414,10 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   {
   case ESP_NOW_SEND_SUCCESS:
     ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "[esp-now] packet to: %s has been sent!", device_id.c_str());
-    packet_fails_number = 0;
     break;
   
   default:
     ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] packet to: %s not sent.", device_id.c_str());
-    packet_fails_number ++;
-    if (packet_fails_number > MAX_PACKET_FAILS) {
-      info_logger("max delivery failure number, starting Pairing Request.");
-      pairingStatus = PAIR_REQUEST;
-    }
     break;
   }
 }
@@ -422,27 +430,25 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
   //only accept messages from server device.
   uint8_t message_type = incomingData[0];
   uint8_t sender_role = incomingData[1];
+
   if (sender_role != SERVER) {
     info_logger("[esp-now] invalid device role. ignoring message");
     return;
   }
 
-  JsonDocument root;
-  String payload;
-
   //get message_type message from first byte.
   switch (message_type) {
   case DATA :      // we received data from server
-    memcpy(&incoming_data, incomingData, sizeof(incoming_data));
-    root["system_mode"] = incoming_data.system_mode;
-    root["system_state"] = incoming_data.system_state;
-    root["sts_temp_sp"] = incoming_data.system_temp_sp;
-    root["room_temp"] = incoming_data.room_temp;
-    serializeJson(root, payload);
-    debug_logger(payload.c_str());
-
+    const unsigned long current = millis();
+    info_logger("[esp-now] message of type DATA received");
+    memcpy(&settings_data, incomingData, sizeof(settings_data));
+    postEspnowFlag = true; // send message to the server
+    lastEspnowReceived = current; // afther this moment.
+    break;
 
   case PAIRING:    // received pairing data from server
+
+    info_logger("[esp-now] message of type PAIRING received");
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
     // add peer to peer list.
     if (!add_peer_to_plist(mac_addr, pairing_data.channel)){ // the server decides the channel.
@@ -459,6 +465,10 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
     pair_request_attempts = 0;
     pairingStatus = PAIR_PAIRED;  // set the pairing status
     //-
+    break;
+
+  default:
+    info_logger("message type not implemented");
     break;
   }
 }
@@ -486,7 +496,7 @@ void espnow_loop(){
 
   if (now_btn_state && currentMillis - lastNowBtnChange > 10000L) {
     // after 10 seconds of now button pressed, default values will be set.
-    lastNowBtnChange = millis();
+    lastNowBtnChange = currentMillis;
     //-
     set_defaults_in_fs();
     //-
@@ -506,6 +516,7 @@ void espnow_loop(){
         if (pair_request_attempts >= MAX_PAIR_ATTEMPTS) {
           // ends pairing process.
           pairingStatus = NOT_PAIRED;
+          pair_request_attempts = 0;
           info_logger("auto-pairing process couln't find the server.");
           break;
         }
@@ -529,7 +540,7 @@ void espnow_loop(){
       //-log
       log_on_result(send_result);
 
-      lastPairingRequest = millis();
+      lastPairingRequest = currentMillis;
       pairingStatus = PAIR_REQUESTED;
     break;
 
@@ -543,7 +554,6 @@ void espnow_loop(){
 
       // time out to allow receiving response from server
       if(currentMillis - lastPairingRequest > ESP_NOW_WAIT_PAIR_RESPONSE) {
-        lastPairingRequest = currentMillis;
         info_logger("[autopairing] time out expired, try on the next channel");
         radio_channel ++;
         if (radio_channel > MAX_CHANNEL){
@@ -577,19 +587,19 @@ void espnow_loop(){
         lastNetworkLedBlink = currentMillis;
         network_led_pulse_effect();
       }
-      //-
-      if (currentMillis - lastEspnowPost >= ESP_NOW_POST_INTERVAL) {
-        // Save the last time a new reading was published
-        lastEspnowPost = currentMillis;
+      //- time based message sent.
+      if (postEspnowFlag && currentMillis - lastEspnowReceived >= ESP_NOW_POST_INTERVAL) {
+        // set flag to false.
+        postEspnowFlag = false;
         //Set values to send
         outgoing_data.msg_type = DATA;
         outgoing_data.sender_role = CONTROLLER;
-        outgoing_data.fault_code = 0x16;
+        outgoing_data.fault_code = 0x00;
         outgoing_data.air_return_temp = air_return_temp;
         outgoing_data.air_supply_temp = air_supply_temp;
-        outgoing_data.drain_switch = true;
-        outgoing_data.cooling_relay = false;
-        outgoing_data.turbine_relay = false;
+        outgoing_data.drain_switch = float_sw_state;
+        outgoing_data.cooling_relay = compressor_state;
+        outgoing_data.turbine_relay = fan_state;
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
       }
@@ -643,7 +653,6 @@ void setup() {
   //- WiFi SETUP
   info_logger("WiFi settings.");
   WiFi.mode(WIFI_MODE_STA);
-  WiFi.begin();
   info_logger("MAC Address:  ->");
   info_logger(WiFi.macAddress().c_str());
   WiFi.disconnect();
