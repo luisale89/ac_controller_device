@@ -42,12 +42,10 @@ float air_supply_temp = 24;
 // esp-now variables
 esp_now_peer_info_t server_peer; // variable holds the data for esp-now communications.
 const int MAX_PAIR_ATTEMPTS = 55; // 5 times on each channel.
-const int MAX_PACKET_FAILS = 18; // 18 times for begin pair process again. check if the server changed channel.
 const char SERIAL_DEFAULT[] = "ffffffffffff";
 uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 int radio_channel = 1; // esp-now communication channel.
 int pair_request_attempts = 0;
-int packet_fails_count = 0;
 bool postEspnowFlag = false;
 
 enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
@@ -57,8 +55,6 @@ enum SysModeEnum {AUTO_MODE, FAN_MODE, COOL_MODE};
 enum SysStateEnum {SYSTEM_ON, SYSTEM_OFF, SYSTEM_SLEEP, UNKN};
 //-vars
 PairingStatusEnum pairingStatus = NOT_PAIRED;
-MessageTypeEnum espnow_msg_type;
-SysModeEnum espnow_system_mode;
 
 typedef struct controller_data_struct {
   MessageTypeEnum msg_type;// (1 byte)
@@ -90,7 +86,7 @@ typedef struct pairing_data_struct {
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
 incoming_settings_struct settings_data = { // initial values.
-  DATA, ROLE_UNSET, FAN_MODE, UNKN, 24,24
+  DATA, ROLE_UNSET, FAN_MODE, UNKN, 24, 24
   };  // data received from server
 pairing_data_struct pairing_data;
 
@@ -101,7 +97,6 @@ unsigned long lastPairingRequest = 0;
 unsigned long currentMillis = 0;
 unsigned long lastNetworkLedBlink = 0;
 unsigned long lastNowBtnChange = 0;
-unsigned long lastCompressorTurnOn = 0;
 unsigned long lastCompressorTurnOff = 0;
 unsigned long lastSystemLog = 0;
 const unsigned long SYSTEM_LOG_DELAY = 1000L; // 1 second.
@@ -472,24 +467,20 @@ void update_IO()
     if (settings_data.system_mode == AUTO_MODE) {
 
       if (air_return_temp <= off_value) {
-        set_fan_state(false);
         set_compressor_state(false);
+        set_fan_state(false);
       }
 
       if (air_return_temp > on_value) {
-        set_fan_state(true);
         set_compressor_state(true);
+        set_fan_state(true);
       }
 
       return;
     }
 
     break;
-  
-  default:
-    set_compressor_state(false);
-    set_fan_state(false);
-    break;
+
   }
 
   return;
@@ -556,6 +547,9 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) { 
   //-
   String mac_str = print_device_mac(mac_addr);
+  String sender_serial = print_device_serial(mac_addr);
+  String server_serial = print_device_serial(server_peer.peer_addr);
+
   ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "[esp-now] %d bytes of data received from: %s", len, mac_str.c_str());
 
   //only accept messages from server device.
@@ -573,6 +567,16 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
   switch (message_type) {
   case DATA :      // we received data from server
     //- DATA type
+    //- validations
+    if (pairingStatus != PAIR_PAIRED) {
+      info_logger("device not paired yet! ignoring data.");
+      break;
+    }
+    if (sender_serial != server_serial) {
+      info_logger("message received from an unknown device, ignoring data.");
+      break;
+    }
+    //- ingest incoming data.
     info_logger("[esp-now] message of type DATA received");
     memcpy(&settings_data, incomingData, sizeof(settings_data));
     postEspnowFlag = true; // flag to send a response to the server.
