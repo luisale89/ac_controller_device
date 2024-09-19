@@ -15,7 +15,7 @@ static const char* TAG = "main";
 
 //pinout
 #define AUTO_RELAY 18
-#define VENT_RELAY 17
+#define FAN_RELAY 17
 #define COMP_RELAY 16
 #define NETWORK_LED 2
 #define Q3_INPUT 14
@@ -36,8 +36,8 @@ DallasTemperature air_return_sensor(&ow_return_temp);
 DallasTemperature air_supply_sensor(&ow_supply_temp);
 int tempSensorResolution = 12; //bits
 int tempRequestDelay = 0;
-float air_return_temp = 0;
-float air_supply_temp = 0;
+float air_return_temp = 24;
+float air_supply_temp = 24;
 
 // esp-now variables
 esp_now_peer_info_t server_peer; // variable holds the data for esp-now communications.
@@ -89,7 +89,9 @@ typedef struct pairing_data_struct {
 
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
-incoming_settings_struct settings_data;  // data received from server
+incoming_settings_struct settings_data = { // initial values.
+  DATA, ROLE_UNSET, FAN_MODE, UNKN, 24,24
+  };  // data received from server
 pairing_data_struct pairing_data;
 
 // time vars.
@@ -100,8 +102,13 @@ unsigned long currentMillis = 0;
 unsigned long lastNetworkLedBlink = 0;
 unsigned long lastNowBtnChange = 0;
 unsigned long lastCompressorTurnOn = 0;
-const unsigned long COMPRESSOR_DELAY = 2L * 60000L; // 2 minutes for compressor turn on.
-const unsigned long ESP_NOW_POST_INTERVAL = 1000; // 1 second after receiving data from the server.
+unsigned long lastCompressorTurnOff = 0;
+unsigned long lastSystemLog = 0;
+const unsigned long SYSTEM_LOG_DELAY = 1000L; // 1 second.
+const unsigned long FAN_OFF_DELAY = 5000L; // 5 seconds delay.
+const unsigned long COMPRESSOR_ON_DELAY = 2L * 60000L; // 2 minutes for compressor turn on.
+const unsigned long ESP_NOW_POST_INTERVAL = 500; // 0,5 seconds after receiving data from the server.
+const unsigned long ESP_NOW_WAIT_SERVER_MSG = 5L * 60000L; // 5 minutes for server message to arrive before PAIRING mode set.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000; // Interval to wait for pairing response from server
 const unsigned long BTN_DEBOUNCE_TIME = 75; // 50ms rebound time constant;
 
@@ -112,10 +119,8 @@ bool float_sw_state = false;
 bool last_float_sw_state = false;
 int led_brightness = 0;
 int led_fade_amount = 5;
-//output states.
 bool compressor_state = false;
 bool fan_state = false;
-bool autocl_state = false;
 
 //-
 void network_led_pulse_effect() {
@@ -322,25 +327,79 @@ void update_temperature_readings()
   if (millis() - lastTempRequest >= tempRequestDelay) {
     //-
     float returnBuffer = air_return_sensor.getTempCByIndex(0);
-    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Return temperature: %3.2f °C", returnBuffer);
     float supplyBuffer = air_supply_sensor.getTempCByIndex(0);
-    ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "Supply temperature: %3.2f °C", supplyBuffer);
-    if (!is_valid_temp(returnBuffer) || !is_valid_temp(supplyBuffer))
-    {
-      error_logger("invalid ds18b20 redings.");
-      return;
+    if (is_valid_temp(returnBuffer)){
+      // update global variable.
+      air_return_temp = returnBuffer;
+    } else {
+      error_logger("invalid reading on return sensor.");
     }
-    // update global variable.
-    air_return_temp = returnBuffer;
+
+    if (is_valid_temp(supplyBuffer))
+    {
+      // update global variable.
+      air_supply_temp = supplyBuffer;
+    } else {
+      error_logger("invalid reading on supply sensor.");
+    }
+    
+    //request new readings.
     air_return_sensor.requestTemperatures();
-    //-
-    air_supply_temp = supplyBuffer;
     air_supply_sensor.requestTemperatures();
     //- set timer
     lastTempRequest = millis();
   }
   return;
 }
+
+void set_compressor_state(bool new_state){
+
+  currentMillis = millis();
+
+  //- turn off the compressor
+  if (new_state == false && compressor_state == true){
+    info_logger("turning off the compressor");
+    digitalWrite(COMP_RELAY, LOW);
+    compressor_state = false;
+    lastCompressorTurnOff = currentMillis;
+    return;
+  }
+
+  //- turn on the compressor
+  if (new_state == true && compressor_state == false){
+    if (currentMillis - lastCompressorTurnOff >= COMPRESSOR_ON_DELAY) {
+      info_logger("turning on the compressor");
+      digitalWrite(COMP_RELAY, HIGH);
+      compressor_state = true;
+      return;
+    }
+  }
+
+  return;
+}
+
+void set_fan_state(bool new_state) {
+
+  //- turn off the fan.
+  if (new_state == false && fan_state == true){
+    // off delay time after the compressor last turn off.
+    if (currentMillis - lastCompressorTurnOff >= FAN_OFF_DELAY) {
+      info_logger("turning off the fan.");
+      digitalWrite(FAN_RELAY, LOW);
+      fan_state = false;
+      return;
+    }
+  }
+
+  if (new_state == true && fan_state == false){
+    info_logger("turning on the fan.");
+    digitalWrite(FAN_RELAY, HIGH);
+    fan_state = true;
+  }
+
+  return;
+}
+
 
 void update_IO()
 {
@@ -359,8 +418,78 @@ void update_IO()
     now_btn_state = current_now_btn;
   }
 
-  //outputs
-  // to-do: function tu update inputs and outputs.
+  //- outputs.
+  // turn off all relays when the device is not PAIRED
+  
+  if (pairingStatus != PAIR_PAIRED) {
+    set_compressor_state(false);
+    set_fan_state(false);
+    digitalWrite(AUTO_RELAY, LOW);
+    return;
+  }
+
+  switch (settings_data.system_state) // state received from server.
+  {
+  case SYSTEM_OFF:
+    set_compressor_state(false);
+    set_fan_state(false);
+    break;
+
+  case SYSTEM_SLEEP:
+    set_compressor_state(false);
+    set_fan_state(false);
+
+  case SYSTEM_ON:
+    // system is on.
+    // turn on the compressor based on the return temp. value.
+    const float on_value = settings_data.system_temp_sp + 0.5; // +0.5 deg.
+    const float off_value = settings_data.system_temp_sp - 0.5; // -0.5
+    //- fan mode function.
+    if (settings_data.system_mode == FAN_MODE) {
+      // turn on the fan only.
+      set_compressor_state(false);
+      set_fan_state(true);
+      return;
+    }
+
+    // cool mode or auto mode.
+    if (settings_data.system_mode == COOL_MODE) {
+      // cooling mode state.
+      // turn on the fan allways.
+      set_fan_state(true);
+      
+      if (air_return_temp <= off_value) {
+        set_compressor_state(false);
+      }
+
+      if (air_return_temp > on_value) {
+        set_compressor_state(true);
+      }
+    }
+
+    if (settings_data.system_mode == AUTO_MODE) {
+
+      if (air_return_temp <= off_value) {
+        set_fan_state(false);
+        set_compressor_state(false);
+      }
+
+      if (air_return_temp > on_value) {
+        set_fan_state(true);
+        set_compressor_state(true);
+      }
+
+      return;
+    }
+
+    break;
+  
+  default:
+    set_compressor_state(false);
+    set_fan_state(false);
+    break;
+  }
+
   return;
 }
 
@@ -436,18 +565,20 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
     return;
   }
 
+  lastEspnowReceived = millis(); // time of the last message received from the server.
+
   //get message_type message from first byte.
   switch (message_type) {
   case DATA :      // we received data from server
-    const unsigned long current = millis();
+    //- DATA type
     info_logger("[esp-now] message of type DATA received");
     memcpy(&settings_data, incomingData, sizeof(settings_data));
-    postEspnowFlag = true; // send message to the server
-    lastEspnowReceived = current; // afther this moment.
+    postEspnowFlag = true; // flag to send a response to the server.
+    //-
     break;
 
   case PAIRING:    // received pairing data from server
-
+    //- PAIRING type
     info_logger("[esp-now] message of type PAIRING received");
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
     // add peer to peer list.
@@ -466,10 +597,6 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
     pairingStatus = PAIR_PAIRED;  // set the pairing status
     //-
     break;
-
-  default:
-    info_logger("message type not implemented");
-    break;
   }
 }
 
@@ -484,6 +611,32 @@ void log_on_result(esp_err_t result) {
   default:
     ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] error sending msg to peer, reason: %s",  esp_err_to_name(result));
     break;
+  }
+
+  return;
+}
+
+void log_system() {
+  currentMillis = millis();
+  JsonDocument root;
+  String doc;
+
+  if (currentMillis - lastSystemLog >= SYSTEM_LOG_DELAY) {
+    lastSystemLog = currentMillis;
+    //- data
+    root["room_t"] = settings_data.room_temp;
+    root["return_t"] = air_return_temp;
+    root["supply_t"] = air_supply_temp;
+    root["system_sp"] = settings_data.system_temp_sp;
+    root["compressor"] = compressor_state;
+    root["fan"] = fan_state;
+    root["sys_state"] = settings_data.system_state;
+    root["sys_mode"] = settings_data.system_mode;
+    root["pairing"] = pairingStatus;
+
+    //- output
+    serializeJson(root, doc);
+    debug_logger(doc.c_str());
   }
 
   return;
@@ -587,6 +740,12 @@ void espnow_loop(){
         lastNetworkLedBlink = currentMillis;
         network_led_pulse_effect();
       }
+
+      if (currentMillis - lastEspnowReceived >= ESP_NOW_WAIT_SERVER_MSG) {
+        info_logger("Timeout since last server message received. Setting up PR Mode.");
+        pairingStatus = PAIR_REQUEST;
+      }
+
       //- time based message sent.
       if (postEspnowFlag && currentMillis - lastEspnowReceived >= ESP_NOW_POST_INTERVAL) {
         // set flag to false.
@@ -597,9 +756,9 @@ void espnow_loop(){
         outgoing_data.fault_code = 0x00;
         outgoing_data.air_return_temp = air_return_temp;
         outgoing_data.air_supply_temp = air_supply_temp;
-        outgoing_data.drain_switch = float_sw_state;
-        outgoing_data.cooling_relay = compressor_state;
-        outgoing_data.turbine_relay = fan_state;
+        outgoing_data.drain_switch = digitalRead(FLOAT_SWTCH);
+        outgoing_data.cooling_relay = digitalRead(COMP_RELAY);
+        outgoing_data.turbine_relay = digitalRead(FAN_RELAY);
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
       }
@@ -620,7 +779,7 @@ void setup() {
   //PINS SETUP
   info_logger("pins settings");
   pinMode(AUTO_RELAY, OUTPUT);
-  pinMode(VENT_RELAY, OUTPUT);
+  pinMode(FAN_RELAY, OUTPUT);
   pinMode(COMP_RELAY, OUTPUT);
   pinMode(NETWORK_LED, OUTPUT);
   pinMode(Q3_INPUT, INPUT_PULLUP);
@@ -678,6 +837,9 @@ void setup() {
   //LOAD DATA FROM FS
   load_server_from_fs();
 
+  currentMillis = millis();
+  lastCompressorTurnOff = currentMillis;
+
   // SETUP FINISHED
   info_logger("setup finished --!.");
   delay(500);
@@ -688,4 +850,5 @@ void loop() {
   update_temperature_readings();
   update_IO();
   espnow_loop();
+  log_system();
 }
