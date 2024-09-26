@@ -64,8 +64,9 @@ typedef struct controller_data_struct {
   float air_supply_temp;   // (4 bytes) [°C]
   bool drain_switch;       // (1 byte)
   bool cooling_relay;      // (1 byte)
-  bool turbine_relay;      // (1 byte)
-} controller_data_struct;  // TOTAL = 14 bytes
+  bool fan_relay;      // (1 byte)
+  unsigned int seconds_since_last_cooling_rq;  // (4 bytes) seconds since last false->true relay change.
+} controller_data_struct;  // TOTAL = 18 bytes
 
 typedef struct incoming_settings_struct {
   MessageTypeEnum msg_type;     // (1 byte)
@@ -91,6 +92,7 @@ incoming_settings_struct settings_data = { // initial values.
 pairing_data_struct pairing_data;
 
 // time vars.
+unsigned int secondsSinceCR = 0; // seconds since last cooling request.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
@@ -98,10 +100,13 @@ unsigned long currentMillis = 0;
 unsigned long lastNetworkLedBlink = 0;
 unsigned long lastNowBtnChange = 0;
 unsigned long lastCompressorTurnOff = 0;
+unsigned long lastFanTurnOn = 0;
 unsigned long lastSystemLog = 0;
+unsigned long lastSecondTick = 0;
 const unsigned long SYSTEM_LOG_DELAY = 1000L; // 1 second.
-const unsigned long FAN_OFF_DELAY = 5000L; // 5 seconds delay.
-const unsigned long COMPRESSOR_ON_DELAY = 2L * 60000L; // 2 minutes for compressor turn on.
+const unsigned long FAN_OFF_DELAY = 5000L; // 5 seconds off-delay.
+const unsigned long COMPRESSOR_ON_DELAY = 5000L; // 5 seconds on-delay.
+const unsigned long COMPRESSOR_SHORT_CYCLING_DELAY = 5L * 60000L; // 5 minutes for compressor short cycling prevention.
 const unsigned long ESP_NOW_POST_INTERVAL = 500; // 0,5 seconds after receiving data from the server.
 const unsigned long ESP_NOW_WAIT_SERVER_MSG = 1L * 60000L; // 1 minute for server message to arrive before PAIRING mode is set.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000; // Interval to wait for pairing response from server
@@ -362,10 +367,24 @@ void set_compressor_state(bool new_state){
 
   //- turn on the compressor
   if (new_state == true && compressor_state == false){
-    if (currentMillis - lastCompressorTurnOff >= COMPRESSOR_ON_DELAY) {
+
+    //-SHORT_CYCLING_PREVENTION-
+    if (currentMillis - lastCompressorTurnOff < COMPRESSOR_SHORT_CYCLING_DELAY) {
+      return;
+    }
+
+    // if the fan is off, the compressor wouldn't turn on.
+    if (!fan_state) {
+      return;
+    }
+
+    //- on_delay since Fan last turn ON.
+    if (currentMillis - lastFanTurnOn >= COMPRESSOR_ON_DELAY) {
       info_logger("turning on the compressor");
       digitalWrite(COMP_RELAY, HIGH);
       compressor_state = true;
+      secondsSinceCR = 0; // restart the counter.
+      lastSecondTick = currentMillis;
       return;
     }
   }
@@ -375,8 +394,25 @@ void set_compressor_state(bool new_state){
 
 void set_fan_state(bool new_state) {
 
+  currentMillis = millis();
+
+  //- turn on the fan.
+  if (new_state == true && fan_state == false){
+    info_logger("turning on the fan.");
+    digitalWrite(FAN_RELAY, HIGH);
+    lastFanTurnOn = currentMillis;
+    fan_state = true;
+    return;
+  }
+  
   //- turn off the fan.
   if (new_state == false && fan_state == true){
+
+    if (!compressor_state){
+      // if the compressor is on, the fan wouldn't turn off..
+      return;
+    }
+
     // off delay time after the compressor last turn off.
     if (currentMillis - lastCompressorTurnOff >= FAN_OFF_DELAY) {
       info_logger("turning off the fan.");
@@ -384,12 +420,6 @@ void set_fan_state(bool new_state) {
       fan_state = false;
       return;
     }
-  }
-
-  if (new_state == true && fan_state == false){
-    info_logger("turning on the fan.");
-    digitalWrite(FAN_RELAY, HIGH);
-    fan_state = true;
   }
 
   return;
@@ -425,14 +455,19 @@ void update_IO()
 
   switch (settings_data.system_state) // state received from server.
   {
-  case SYSTEM_OFF:
-    set_compressor_state(false);
+  case UNKN:
     set_fan_state(false);
+    set_compressor_state(false);
+    break;;
+
+  case SYSTEM_OFF:
+    set_fan_state(false);
+    set_compressor_state(false);
     break;
 
   case SYSTEM_SLEEP:
-    set_compressor_state(false);
     set_fan_state(false);
+    set_compressor_state(false);
     break;
 
   case SYSTEM_ON:
@@ -443,8 +478,8 @@ void update_IO()
     //- fan mode function.
     if (settings_data.system_mode == FAN_MODE) {
       // turn on the fan only.
-      set_compressor_state(false);
       set_fan_state(true);
+      set_compressor_state(false);
       return;
     }
 
@@ -456,9 +491,7 @@ void update_IO()
       
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
-      }
-
-      if (air_return_temp > on_value) {
+      } else {
         set_compressor_state(true);
       }
 
@@ -470,9 +503,7 @@ void update_IO()
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
         set_fan_state(false);
-      }
-
-      if (air_return_temp > on_value) {
+      } else {
         set_compressor_state(true);
         set_fan_state(true);
       }
@@ -482,6 +513,24 @@ void update_IO()
 
     //-breaks;
     break;
+  }
+
+  return;
+}
+
+void update_cr_counter() {
+
+  currentMillis = millis();
+
+  if (!compressor_state) {
+    //nothing to count when the compressor is off.
+    return;
+  }
+
+  if (currentMillis - lastSecondTick >= 1000) {
+    //1 second count
+    lastSecondTick = currentMillis;
+    secondsSinceCR ++; // sum 1 second to the counter.
   }
 
   return;
@@ -623,7 +672,7 @@ void log_on_result(esp_err_t result) {
   return;
 }
 
-void log_system() {
+void system_logs() {
   currentMillis = millis();
   JsonDocument root;
   String doc;
@@ -640,6 +689,7 @@ void log_system() {
     root["sys_state"] = settings_data.system_state;
     root["sys_mode"] = settings_data.system_mode;
     root["pairing"] = pairingStatus;
+    root["last_cr_cnt"] = secondsSinceCR;
 
     //- output
     serializeJson(root, doc);
@@ -763,9 +813,11 @@ void espnow_loop(){
         outgoing_data.fault_code = 0x00;
         outgoing_data.air_return_temp = air_return_temp;
         outgoing_data.air_supply_temp = air_supply_temp;
-        outgoing_data.drain_switch = digitalRead(FLOAT_SWTCH);
-        outgoing_data.cooling_relay = digitalRead(COMP_RELAY);
-        outgoing_data.turbine_relay = digitalRead(FAN_RELAY);
+        outgoing_data.drain_switch = digitalRead(FLOAT_SWTCH); //to-do.. need to update this to the state.
+        outgoing_data.cooling_relay = compressor_state;
+        outgoing_data.fan_relay = fan_state;
+        outgoing_data.seconds_since_last_cooling_rq = secondsSinceCR;
+
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
       }
@@ -792,6 +844,7 @@ void setup() {
   pinMode(Q3_INPUT, INPUT_PULLUP);
   pinMode(Q2_INPUT, INPUT_PULLUP);
   pinMode(Q1_INPUT, INPUT_PULLUP);
+  pinMode(FLOAT_SWTCH, INPUT);
   pinMode(NOW_CNF, INPUT);
   info_logger("pins settings done.");
 
@@ -856,6 +909,7 @@ void loop() {
   //-
   update_temperature_readings();
   update_IO();
+  update_cr_counter();
   espnow_loop();
-  log_system();
+  system_logs();
 }
