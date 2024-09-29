@@ -444,7 +444,7 @@ void update_IO()
     last_now_btn_state = current_now_btn;
   }
 
-  if (currentMillis - lastNowBtnChange > BTN_DEBOUNCE_TIME) {
+  if (currentMillis - lastNowBtnChange >= BTN_DEBOUNCE_TIME) {
     // btn change.
     now_btn_state = current_now_btn;
   }
@@ -455,7 +455,7 @@ void update_IO()
     last_float_sw_state = current_float_switch;
   }
 
-  if (currentMillis - lastFloatSwitchChange > BTN_DEBOUNCE_TIME){
+  if (currentMillis - lastFloatSwitchChange >= BTN_DEBOUNCE_TIME){
     // float changed value.
     float_sw_state = current_float_switch;
   }
@@ -510,7 +510,7 @@ void update_IO()
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
       } else {
-        set_compressor_state(true);
+        set_compressor_state(true & float_sw_state);
       }
 
       return;
@@ -522,7 +522,7 @@ void update_IO()
         set_compressor_state(false);
         set_fan_state(false);
       } else {
-        set_compressor_state(true);
+        set_compressor_state(true & float_sw_state);
         set_fan_state(true);
       }
 
