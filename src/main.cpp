@@ -92,13 +92,14 @@ incoming_settings_struct settings_data = { // initial values.
 pairing_data_struct pairing_data;
 
 // time vars.
-unsigned int secondsSinceCR = 0; // seconds since last cooling request.
+unsigned int secSinceCoolingReq = 0; // seconds since last cooling request.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
 unsigned long currentMillis = 0;
 unsigned long lastNetworkLedBlink = 0;
 unsigned long lastNowBtnChange = 0;
+unsigned long lastFloatSwitchChange = 0;
 unsigned long lastCompressorTurnOff = 0;
 unsigned long lastFanTurnOn = 0;
 unsigned long lastSystemLog = 0;
@@ -106,11 +107,11 @@ unsigned long lastSecondTick = 0;
 const unsigned long SYSTEM_LOG_DELAY = 1000L; // 1 second.
 const unsigned long FAN_OFF_DELAY = 5000L; // 5 seconds off-delay.
 const unsigned long COMPRESSOR_ON_DELAY = 5000L; // 5 seconds on-delay.
-const unsigned long COMPRESSOR_SHORT_CYCLING_DELAY = 5L * 60000L; // 5 minutes for compressor short cycling prevention.
+const unsigned long COMPRESSOR_SHORT_CYCLING_DELAY = 3L * 60000L; // 3 minutes for compressor short cycling prevention.
 const unsigned long ESP_NOW_POST_INTERVAL = 500; // 0,5 seconds after receiving data from the server.
 const unsigned long ESP_NOW_WAIT_SERVER_MSG = 1L * 60000L; // 1 minute for server message to arrive before PAIRING mode is set.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000; // Interval to wait for pairing response from server
-const unsigned long BTN_DEBOUNCE_TIME = 75; // 50ms rebound time constant;
+const unsigned long BTN_DEBOUNCE_TIME = 100; // 100ms rebound time constant;
 
 // gen vars
 bool now_btn_state = false;
@@ -121,6 +122,8 @@ int led_brightness = 0;
 int led_fade_amount = 5;
 bool compressor_state = false;
 bool fan_state = false;
+uint8_t ret_sensor_fcode = 0;
+uint8_t sup_sensor_fcode = 0;
 
 //-
 void network_led_pulse_effect() {
@@ -333,6 +336,7 @@ void update_temperature_readings()
       air_return_temp = returnBuffer;
     } else {
       error_logger("invalid reading on return sensor.");
+      ret_sensor_fcode = 0xF0;
     }
 
     if (is_valid_temp(supplyBuffer))
@@ -341,6 +345,7 @@ void update_temperature_readings()
       air_supply_temp = supplyBuffer;
     } else {
       error_logger("invalid reading on supply sensor.");
+      sup_sensor_fcode = 0x0F;
     }
     
     //request new readings.
@@ -383,7 +388,7 @@ void set_compressor_state(bool new_state){
       info_logger("turning on the compressor");
       digitalWrite(COMP_RELAY, HIGH);
       compressor_state = true;
-      secondsSinceCR = 0; // restart the counter.
+      secSinceCoolingReq = 0; // restart the counter.
       lastSecondTick = currentMillis;
       return;
     }
@@ -408,7 +413,7 @@ void set_fan_state(bool new_state) {
   //- turn off the fan.
   if (new_state == false && fan_state == true){
 
-    if (!compressor_state){
+    if (compressor_state){
       // if the compressor is on, the fan wouldn't turn off..
       return;
     }
@@ -433,6 +438,7 @@ void update_IO()
   const bool current_now_btn = digitalRead(NOW_CNF) ? false : true; //button is active low.
   const bool current_float_switch = digitalRead(FLOAT_SWTCH) ? false : true; // float switch is active low.
 
+  // now button debounce.
   if (current_now_btn != last_now_btn_state) {
     lastNowBtnChange = currentMillis;
     last_now_btn_state = current_now_btn;
@@ -443,10 +449,22 @@ void update_IO()
     now_btn_state = current_now_btn;
   }
 
+  // float switch debounce.
+  if (current_float_switch != last_float_sw_state) {
+    lastFloatSwitchChange = currentMillis;
+    last_float_sw_state = current_float_switch;
+  }
+
+  if (currentMillis - lastFloatSwitchChange > BTN_DEBOUNCE_TIME){
+    // float changed value.
+    float_sw_state = current_float_switch;
+  }
+
   //- outputs.
   // turn off all relays when the device is not PAIRED
   
-  if (pairingStatus != PAIR_PAIRED) {
+  if (pairingStatus != PAIR_PAIRED && pair_request_attempts >= 150) {
+    // after 150 attempts of connection with the server. (approx. 5 min)
     set_compressor_state(false);
     set_fan_state(false);
     digitalWrite(AUTO_RELAY, LOW);
@@ -530,7 +548,7 @@ void update_cr_counter() {
   if (currentMillis - lastSecondTick >= 1000) {
     //1 second count
     lastSecondTick = currentMillis;
-    secondsSinceCR ++; // sum 1 second to the counter.
+    secSinceCoolingReq ++; // sum 1 second to the counter.
   }
 
   return;
@@ -681,15 +699,16 @@ void system_logs() {
     lastSystemLog = currentMillis;
     //- data
     root["room_t"] = settings_data.room_temp;
-    root["return_t"] = air_return_temp;
-    root["supply_t"] = air_supply_temp;
-    root["system_sp"] = settings_data.system_temp_sp;
-    root["compressor"] = compressor_state;
+    root["retu_t"] = air_return_temp;
+    root["supp_t"] = air_supply_temp;
+    root["sys_sp"] = settings_data.system_temp_sp;
+    root["comp"] = compressor_state;
     root["fan"] = fan_state;
-    root["sys_state"] = settings_data.system_state;
-    root["sys_mode"] = settings_data.system_mode;
-    root["pairing"] = pairingStatus;
-    root["last_cr_cnt"] = secondsSinceCR;
+    root["sys_st"] = settings_data.system_state;
+    root["sys_mo"] = settings_data.system_mode;
+    root["pair"] = pairingStatus;
+    root["cr_cnt"] = secSinceCoolingReq;
+    root["float"] = float_sw_state;
 
     //- output
     serializeJson(root, doc);
@@ -810,17 +829,20 @@ void espnow_loop(){
         //Set values to send
         outgoing_data.msg_type = DATA;
         outgoing_data.sender_role = CONTROLLER;
-        outgoing_data.fault_code = 0x00;
+        outgoing_data.fault_code = ret_sensor_fcode | sup_sensor_fcode;
         outgoing_data.air_return_temp = air_return_temp;
         outgoing_data.air_supply_temp = air_supply_temp;
-        outgoing_data.drain_switch = digitalRead(FLOAT_SWTCH); //to-do.. need to update this to the state.
+        outgoing_data.drain_switch = float_sw_state;
         outgoing_data.cooling_relay = compressor_state;
         outgoing_data.fan_relay = fan_state;
-        outgoing_data.seconds_since_last_cooling_rq = secondsSinceCR;
+        outgoing_data.seconds_since_last_cooling_rq = secSinceCoolingReq;
 
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
+        ret_sensor_fcode = 0x00;
+        sup_sensor_fcode = 0x00;
       }
+      //-
     break;
   }
 
