@@ -48,7 +48,7 @@ int radio_channel = 1; // esp-now communication channel.
 int pair_request_attempts = 0;
 bool postEspnowFlag = false;
 
-enum PeerRoleID {SERVER, CONTROLLER, MONITOR_A, MONITOR_B, ROLE_UNSET};
+enum PeerRoleID {SERVER, CONTROLLER, MONITOR, UNSET};
 enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
 enum MessageTypeEnum {PAIRING, DATA,};
 enum SysModeEnum {AUTO_MODE, FAN_MODE, COOL_MODE};
@@ -87,7 +87,7 @@ typedef struct pairing_data_struct {
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
 incoming_settings_struct settings_data = { // initial values.
-  DATA, ROLE_UNSET, FAN_MODE, UNKN, 24, 24
+  DATA, UNSET, FAN_MODE, UNKN, 24, 24
   };  // data received from server
 pairing_data_struct pairing_data;
 
