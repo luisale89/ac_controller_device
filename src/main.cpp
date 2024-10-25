@@ -64,8 +64,9 @@ typedef struct controller_data_struct {
   float air_supply_temp;   // (4 bytes) [°C]
   bool drain_switch;       // (1 byte)
   bool cooling_relay;      // (1 byte)
-  bool fan_relay;      // (1 byte)
+  bool fan_relay;          // (1 byte)
   unsigned int seconds_since_last_cooling_rq;  // (4 bytes) seconds since last false->true relay change.
+  unsigned int total_cooling_rq_hours; // (4 bytes) total cooling request seconds. state in controller device.
 } controller_data_struct;  // TOTAL = 18 bytes
 
 typedef struct incoming_settings_struct {
@@ -75,6 +76,7 @@ typedef struct incoming_settings_struct {
   SysStateEnum system_state;    // (1 byte)
   float system_temp_sp;         // (4 bytes) [°C]
   float room_temp;              // (4 bytes) [°C]
+  bool monitor_board_relay;     // (1 byte) > control over the alarm relay of the monitor.
 } incoming_settings_struct;     // TOTAL = 7 bytes
 
 typedef struct pairing_data_struct {
@@ -87,12 +89,13 @@ typedef struct pairing_data_struct {
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
 incoming_settings_struct settings_data = { // initial values.
-  DATA, UNSET, FAN_MODE, UNKN, 24, 24
+  DATA, UNSET, FAN_MODE, UNKN, 24, 24, false
   };  // data received from server
 pairing_data_struct pairing_data;
 
 // time vars.
 unsigned int secSinceCoolingReq = 0; // seconds since last cooling request.
+unsigned int coolingSecondsTick = 0; // total cooling request counter.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
@@ -120,6 +123,7 @@ bool float_sw_state = false;
 bool last_float_sw_state = false;
 int led_brightness = 0;
 int led_fade_amount = 5;
+unsigned int hourmeter_count = 0;
 bool compressor_state = false;
 bool fan_state = false;
 uint8_t ret_sensor_fcode = 0;
@@ -476,16 +480,19 @@ void update_IO()
   case UNKN:
     set_fan_state(false);
     set_compressor_state(false);
+    digitalWrite(AUTO_RELAY, LOW);
     break;;
 
   case SYSTEM_OFF:
     set_fan_state(false);
     set_compressor_state(false);
+    digitalWrite(AUTO_RELAY, HIGH);
     break;
 
   case SYSTEM_SLEEP:
     set_fan_state(false);
     set_compressor_state(false);
+    digitalWrite(AUTO_RELAY, HIGH);
     break;
 
   case SYSTEM_ON:
@@ -493,6 +500,8 @@ void update_IO()
     // turn on the compressor based on the return temp. value.
     const float on_value = settings_data.system_temp_sp + 0.5; // +0.5 deg.
     const float off_value = settings_data.system_temp_sp - 0.5; // -0.5
+    //enable system funct.
+    digitalWrite(AUTO_RELAY, LOW);
     //- fan mode function.
     if (settings_data.system_mode == FAN_MODE) {
       // turn on the fan only.
@@ -536,6 +545,61 @@ void update_IO()
   return;
 }
 
+
+void load_hourmeter_from_fs() {
+  info_logger("-> loading hourmeter from fs");
+  JsonDocument json;
+  String hourmeter_data = load_data_from_fs("/hourmeter.txt");
+
+  DeserializationError error = deserializeJson(json, hourmeter_data);
+  if (error) {
+    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
+    return;
+  }
+
+  hourmeter_count = json["hours"] | 0;
+
+  return;
+}
+
+
+void update_hourmeter_in_fs() {
+
+  // call this function every minute.
+
+  info_logger("updating hourmeter in fs.");
+  const char * target_file = "/hourmeter.txt";
+  JsonDocument json;
+  JsonDocument new_json;
+  String new_hourmeter;
+  String hourmeter_data = load_data_from_fs(target_file);
+
+  DeserializationError error = deserializeJson(json, hourmeter_data);
+  if (error)
+  {
+    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
+    return;
+  }
+
+  const int current_h = json["hours"] | 0;
+  const int current_m = json["minutes"] | 0;
+
+  if (current_m < 59) {
+    new_json["minutes"] = current_m + 1;
+    new_json["hours"] = current_h;
+  } else {
+    new_json["minutes"] = 0;
+    new_json["hours"] = current_h + 1;
+  }
+
+  //update global value.
+  hourmeter_count = new_json["hours"];
+
+  serializeJson(new_json, new_hourmeter);
+  save_data_in_fs(new_hourmeter, target_file);
+}
+
+
 void update_cr_counter() {
 
   currentMillis = millis();
@@ -549,6 +613,12 @@ void update_cr_counter() {
     //1 second count
     lastSecondTick = currentMillis;
     secSinceCoolingReq ++; // sum 1 second to the counter.
+    coolingSecondsTick ++;
+
+    if (coolingSecondsTick >= 60) { // every minute.
+      update_hourmeter_in_fs();
+      coolingSecondsTick = 0;
+    }
   }
 
   return;
@@ -709,6 +779,7 @@ void system_logs() {
     root["pair"] = pairingStatus;
     root["cr_cnt"] = secSinceCoolingReq;
     root["float"] = float_sw_state;
+    root["hourmt"] = hourmeter_count;
 
     //- output
     serializeJson(root, doc);
@@ -836,6 +907,7 @@ void espnow_loop(){
         outgoing_data.cooling_relay = compressor_state;
         outgoing_data.fan_relay = fan_state;
         outgoing_data.seconds_since_last_cooling_rq = secSinceCoolingReq;
+        outgoing_data.total_cooling_rq_hours = hourmeter_count;
 
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
@@ -918,6 +990,7 @@ void setup() {
 
   //LOAD DATA FROM FS
   load_server_from_fs();
+  load_hourmeter_from_fs();
 
   currentMillis = millis();
   lastCompressorTurnOff = currentMillis;
