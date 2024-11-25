@@ -465,13 +465,14 @@ void update_IO()
   }
 
   //- outputs.
+  //- for now, AUTO_RELAY will allways be off...
+  digitalWrite(AUTO_RELAY, LOW);
+
   // turn off all relays when the device is not PAIRED
-  
   if (pairingStatus != PAIR_PAIRED && pair_request_attempts >= 150) {
     // after 150 attempts of connection with the server. (approx. 5 min)
     set_compressor_state(false);
     set_fan_state(false);
-    digitalWrite(AUTO_RELAY, LOW);
     return;
   }
 
@@ -480,19 +481,16 @@ void update_IO()
   case UNKN:
     set_fan_state(false);
     set_compressor_state(false);
-    digitalWrite(AUTO_RELAY, LOW);
     break;;
 
   case SYSTEM_OFF:
     set_fan_state(false);
     set_compressor_state(false);
-    digitalWrite(AUTO_RELAY, HIGH);
     break;
 
   case SYSTEM_SLEEP:
     set_fan_state(false);
     set_compressor_state(false);
-    digitalWrite(AUTO_RELAY, HIGH);
     break;
 
   case SYSTEM_ON:
@@ -500,8 +498,7 @@ void update_IO()
     // turn on the compressor based on the return temp. value.
     const float on_value = settings_data.system_temp_sp + 0.5; // +0.5 deg.
     const float off_value = settings_data.system_temp_sp - 0.5; // -0.5
-    //enable system funct.
-    digitalWrite(AUTO_RELAY, LOW);
+
     //- fan mode function.
     if (settings_data.system_mode == FAN_MODE) {
       // turn on the fan only.
@@ -518,7 +515,7 @@ void update_IO()
       
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
-      } else {
+      } else if (air_return_temp >= on_value){
         set_compressor_state(true & float_sw_state);
       }
 
@@ -530,9 +527,9 @@ void update_IO()
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
         set_fan_state(false);
-      } else {
-        set_compressor_state(true & float_sw_state);
+      } else if (air_return_temp >= on_value){
         set_fan_state(true);
+        set_compressor_state(true & float_sw_state);
       }
 
       return;
