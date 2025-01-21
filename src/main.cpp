@@ -66,7 +66,7 @@ typedef struct controller_data_struct {
   bool cooling_relay;      // (1 byte)
   bool fan_relay;          // (1 byte)
   unsigned int seconds_since_last_cooling_rq;  // (4 bytes) seconds since last false->true relay change.
-  unsigned int total_cooling_rq_hours; // (4 bytes) total cooling request seconds. state in controller device.
+  unsigned int total_system_hours; // (4 bytes) total cooling request seconds. state in controller device.
 } controller_data_struct;  // TOTAL = 18 bytes
 
 typedef struct incoming_settings_struct {
@@ -76,8 +76,9 @@ typedef struct incoming_settings_struct {
   SysStateEnum system_state;    // (1 byte)
   float system_temp_sp;         // (4 bytes) [°C]
   float room_temp;              // (4 bytes) [°C]
-  bool monitor_board_relay;     // (1 byte) > control over the alarm relay of the monitor.
-} incoming_settings_struct;     // TOTAL = 7 bytes
+  bool monitor_remote_alarm;    // (1 byte) > control over the alarm relay of the monitor.
+  bool monitor_alarm_rstrt;     // (1 byte) > restart all alarms from the broker.
+} incoming_settings_struct;     // TOTAL = 13 bytes
 
 typedef struct pairing_data_struct {
   MessageTypeEnum msg_type;     // (1 byte)
@@ -89,13 +90,13 @@ typedef struct pairing_data_struct {
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
 incoming_settings_struct settings_data = { // initial values.
-  DATA, UNSET, FAN_MODE, UNKN, 24, 24, false
+  DATA, UNSET, FAN_MODE, UNKN, 24, 24, false, false
   };  // data received from server
 pairing_data_struct pairing_data;
 
 // time vars.
-unsigned int secSinceCoolingReq = 0; // seconds since last cooling request.
-unsigned int coolingSecondsTick = 0; // total cooling request counter.
+unsigned int compressorRunningSeconds = 0; // seconds since last cooling request.
+unsigned int fanRunningSeconds = 0; // total cooling request counter.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
@@ -392,8 +393,7 @@ void set_compressor_state(bool new_state){
       info_logger("turning on the compressor");
       digitalWrite(COMP_RELAY, HIGH);
       compressor_state = true;
-      secSinceCoolingReq = 0; // restart the counter.
-      lastSecondTick = currentMillis;
+      compressorRunningSeconds = 0; // restart the counter.
       return;
     }
   }
@@ -411,6 +411,7 @@ void set_fan_state(bool new_state) {
     digitalWrite(FAN_RELAY, HIGH);
     lastFanTurnOn = currentMillis;
     fan_state = true;
+    lastSecondTick = currentMillis; // set lastSecondTick to currentMillis to count from this moment.
     return;
   }
   
@@ -597,24 +598,27 @@ void update_hourmeter_in_fs() {
 }
 
 
-void update_cr_counter() {
+void update_time_counter() {
 
   currentMillis = millis();
 
-  if (!compressor_state) {
-    //nothing to count when the compressor is off.
+  if (!fan_state) {
+    //nothing to count when the fan is off.
     return;
   }
-
+  
   if (currentMillis - lastSecondTick >= 1000) {
     //1 second count
     lastSecondTick = currentMillis;
-    secSinceCoolingReq ++; // sum 1 second to the counter.
-    coolingSecondsTick ++;
 
-    if (coolingSecondsTick >= 60) { // every minute.
+    if (compressor_state) {
+      compressorRunningSeconds ++; // sum 1 second to the counter.
+    }
+
+    fanRunningSeconds ++;
+    if (fanRunningSeconds >= 60) { // every minute.
+      fanRunningSeconds = 0;
       update_hourmeter_in_fs();
-      coolingSecondsTick = 0;
     }
   }
 
@@ -774,7 +778,7 @@ void system_logs() {
     root["sys_st"] = settings_data.system_state;
     root["sys_mo"] = settings_data.system_mode;
     root["pair"] = pairingStatus;
-    root["cr_cnt"] = secSinceCoolingReq;
+    root["cr_cnt"] = compressorRunningSeconds;
     root["float"] = float_sw_state;
     root["hourmt"] = hourmeter_count;
 
@@ -890,7 +894,7 @@ void espnow_loop(){
         pairingStatus = PAIR_REQUEST;
       }
 
-      //- time based message sent.
+      //- resonds to the server...
       if (postEspnowFlag && currentMillis - lastEspnowReceived >= ESP_NOW_POST_INTERVAL) {
         // set flag to false.
         postEspnowFlag = false;
@@ -903,8 +907,8 @@ void espnow_loop(){
         outgoing_data.drain_switch = float_sw_state;
         outgoing_data.cooling_relay = compressor_state;
         outgoing_data.fan_relay = fan_state;
-        outgoing_data.seconds_since_last_cooling_rq = secSinceCoolingReq;
-        outgoing_data.total_cooling_rq_hours = hourmeter_count;
+        outgoing_data.seconds_since_last_cooling_rq = compressorRunningSeconds;
+        outgoing_data.total_system_hours = hourmeter_count;
 
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
@@ -1001,7 +1005,7 @@ void loop() {
   //-
   update_temperature_readings();
   update_IO();
-  update_cr_counter();
+  update_time_counter();
   espnow_loop();
-  system_logs();
+  // system_logs();
 }
