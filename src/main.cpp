@@ -525,11 +525,12 @@ void update_IO()
 
     if (settings_data.system_mode == AUTO_MODE) {
 
+      set_fan_state(true);
+      // turn on the fan allways.
+      
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
-        set_fan_state(false);
       } else if (air_return_temp >= on_value){
-        set_fan_state(true);
         set_compressor_state(true & float_sw_state);
       }
 
