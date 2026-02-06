@@ -53,50 +53,49 @@ enum PairingStatusEnum {PAIR_REQUEST, PAIR_REQUESTED, PAIR_PAIRED, NOT_PAIRED};
 enum MessageTypeEnum {PAIRING, DATA,};
 enum SysModeEnum {AUTO_MODE, FAN_MODE, COOL_MODE};
 enum SysStateEnum {SYSTEM_ON, SYSTEM_OFF, SYSTEM_SLEEP, UNKN};
+enum SysStatusFlag {STATUS_OK, STATUS_WARNING, STATUS_ERROR};
 //-vars
 PairingStatusEnum pairingStatus = NOT_PAIRED;
 
-typedef struct controller_data_struct {
+typedef struct {
   MessageTypeEnum msg_type;// (1 byte)
   PeerRoleID sender_role;  // (1 byte)
-  uint8_t fault_code;      // (1 byte)
+  int fault_code;      // (1 byte)
   float air_return_temp;   // (4 bytes) [°C]
   float air_supply_temp;   // (4 bytes) [°C]
   bool drain_switch;       // (1 byte)
   bool cooling_relay;      // (1 byte)
   bool fan_relay;          // (1 byte)
   unsigned int seconds_since_last_cooling_rq;  // (4 bytes) seconds since last false->true relay change.
-  unsigned int total_system_hours; // (4 bytes) total cooling request seconds. state in controller device.
+  unsigned int total_system_hours; // (4 bytes) total system running hours. state lives in the controller device.
 } controller_data_struct;  // TOTAL = 18 bytes
 
-typedef struct incoming_settings_struct {
+typedef struct {
   MessageTypeEnum msg_type;     // (1 byte)
   PeerRoleID sender_role;       // (1 byte)
-  SysModeEnum system_mode;      // (1 byte)
+  SysModeEnum peers_mode;      // (1 byte)
   SysStateEnum system_state;    // (1 byte)
   float system_temp_sp;         // (4 bytes) [°C]
-  float room_temp;              // (4 bytes) [°C]
-  bool monitor_remote_alarm;    // (1 byte) > control over the alarm relay of the monitor.
-  bool monitor_alarm_rstrt;     // (1 byte) > restart all alarms from the broker.
+  SysStatusFlag alarm_status;   // (1 byte) - controls if the relays are enabled or not
 } incoming_settings_struct;     // TOTAL = 13 bytes
 
-typedef struct pairing_data_struct {
+typedef struct {
   MessageTypeEnum msg_type;     // (1 byte)
   PeerRoleID sender_role;       // (1 byte)
   PeerRoleID device_new_role;   // (1 byte)
-  uint8_t channel;              // (1 byte) - 0 is default, let this value for future changes.
+  int channel;              // (1 byte) - 0 is default, let this value for future changes.
 } pairing_data_struct;          // TOTAL = 9 bytes
 
 //Create 2 struct_message 
 controller_data_struct outgoing_data;  // data to send
 incoming_settings_struct settings_data = { // initial values.
-  DATA, UNSET, FAN_MODE, UNKN, 24, 24, false, false
+  DATA, SERVER, FAN_MODE, UNKN, 24, STATUS_OK
   };  // data received from server
 pairing_data_struct pairing_data;
 
 // time vars.
 unsigned int compressorRunningSeconds = 0; // seconds since last cooling request.
-unsigned int fanRunningSeconds = 0; // total cooling request counter.
+unsigned int systemRunningSeconds = 0; // total cooling request counter.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
@@ -142,45 +141,46 @@ void network_led_pulse_effect() {
 
 //logger function
 void debug_logger(const char *message) {
-  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "%s", message);
+  ESP_LOGD(TAG, "%s", message);
 }
 
 void info_logger(const char *message) {
-  ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "%s", message);
+  ESP_LOGI(TAG, "%s", message);
 }
 
-void error_logger(const char *message) {
-  ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "%s", message);
-}
-
-// función que carga una String que contiene toda la información dentro del target_file del SPIFFS.
-String load_data_from_fs(const char *target_file) {
+// función que carga datos que contiene toda la información dentro del target_file del SPIFFS.
+const char* load_data_from_fs(const char *target_file) {
   //-
-  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "loading data from %s", target_file);
+  static char buffer[256];
+  ESP_LOGD(TAG, "loading data from %s", target_file);
   //-
   File f = SPIFFS.open(target_file);
   if (!f) {
-    error_logger("Error al abrir el archivo solicitado.");
-    return "null";
+    ESP_LOGE(TAG, "Error al abrir el archivo solicitado.");
+    strcpy(buffer, "null");
+    return buffer;
   }
 
-  String file_string = f.readString();
+  size_t size = f.size();
+  if (size >= sizeof(buffer)) size = sizeof(buffer) - 1;
+  f.readBytes(buffer, size);
+  buffer[size] = '\0';
   f.close();
   delay(100);
 
   //log
-  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "data loaded from SPIFFS: %s", file_string.c_str());
-  return file_string;
+  ESP_LOGD(TAG, "data loaded from SPIFFS: %s", buffer);
+  return buffer;
 }
 
-// función que guarda una String en el target_file del SPIFFS.
-void save_data_in_fs(String data_to_save, const char *target_file) {
+// función que guarda datos en el target_file del SPIFFS.
+void save_data_in_fs(const char *data_to_save, const char *target_file) {
   //savin data in filesystem.
-  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "saving in:%s this data:%s", target_file, data_to_save.c_str());
+  ESP_LOGD(TAG, "saving in:%s this data:%s", target_file, data_to_save);
 
   File f = SPIFFS.open(target_file, "w");
   if (!f){
-    error_logger("Error al abrir el archivo solicitado.");
+    ESP_LOGE(TAG, "Error al abrir el archivo solicitado.");
     return;
   }
 
@@ -193,23 +193,19 @@ void save_data_in_fs(String data_to_save, const char *target_file) {
 }
 
 // print mac address.
-String print_device_mac(const uint8_t * mac_addr) {
-  char mac_str[18];
+const char* print_device_mac(const uint8_t * mac_addr) {
+  static char mac_str[18];
   snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  // return mac_str;
-  String str = (char*) mac_str;
-  return str;
+  return mac_str;
 }
 
 //get device id from mac address.
-String print_device_serial(const uint8_t * mac_addr) {
-  char mac_str[18];
+const char* print_device_serial(const uint8_t * mac_addr) {
+  static char mac_str[13];
   snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-  // return mac_str;
-  String str = (char*) mac_str;
-  return str;
+  return mac_str;
 }
 
 //- mac address parser
@@ -227,7 +223,7 @@ void parse_mac_address(const char* str, char sep, byte* bytes, int maxBytes, int
 void set_defaults_in_fs(){
   info_logger("saving server default values in the fs.");
   JsonDocument json_doc;
-  String data;
+  char data[256];
 
   //create json_doc
   json_doc["server_serial"] = "ffffffffffff";
@@ -246,7 +242,7 @@ void save_server_in_fs(const uint8_t *new_mac_address, uint8_t new_channel) {
 
   info_logger("Saving new server data in the fs.");
   JsonDocument server_json;
-  String data;
+  char data[256];
   
   // create json
   server_json["server_serial"] = print_device_serial(new_mac_address);
@@ -264,11 +260,11 @@ void load_server_from_fs() {
   info_logger("Loading server data from fs.");
 
   JsonDocument server_json;
-  String server_data = load_data_from_fs("/now_server.txt");
+  const char* server_data = load_data_from_fs("/now_server.txt");
   DeserializationError error = deserializeJson(server_json, server_data);
   if (error)
   {
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "server_json Deserialization error raised with code: %s", error.c_str());
+    ESP_LOGE(TAG, "server_json Deserialization error raised with code: %s", error.c_str());
     return;
   }
 
@@ -278,16 +274,16 @@ void load_server_from_fs() {
 
   //- validations.
   if (radio_channel < 1 || radio_channel > MAX_CHANNEL) {
-    error_logger("Invalid Wifi channel stored in fs. setting channel to default value.");
+    ESP_LOGE(TAG, "Invalid Wifi channel stored in fs. setting channel to default value.");
     server_channel = 1;
   }
 
   if (strcmp(server_ser, "null") == 0) {
-    error_logger("server id not found in fs.");
+    ESP_LOGE(TAG, "server id not found in fs.");
     return;
   }
   if (strcmp(server_mac_str, "null") == 0) {
-    error_logger("server mac addres not found in fs.");
+    ESP_LOGE(TAG, "server mac addres not found in fs.");
     return;
   }
 
@@ -323,10 +319,15 @@ bool is_valid_temp(float measurement) {
   char name[8] = "ds18B20";
 
   if (measurement == -127) {
-    sprintf(message_buffer, "Error -127; [%s]", name);
-    error_logger(message_buffer);
+    ESP_LOGE(TAG,"Error -127; [%s]", name);
     return false;
   }
+
+  if (measurement == 85.0) {
+    ESP_LOGE(TAG, "Error 85; [%s]", name);
+    return false;
+  }
+
   return true;
 }
 
@@ -340,7 +341,7 @@ void update_temperature_readings()
       // update global variable.
       air_return_temp = returnBuffer;
     } else {
-      error_logger("invalid reading on return sensor.");
+      ESP_LOGE(TAG, "invalid reading on return sensor.");
       ret_sensor_fcode = 0xF0;
     }
 
@@ -349,7 +350,7 @@ void update_temperature_readings()
       // update global variable.
       air_supply_temp = supplyBuffer;
     } else {
-      error_logger("invalid reading on supply sensor.");
+      ESP_LOGE(TAG, "invalid reading on supply sensor.");
       sup_sensor_fcode = 0x0F;
     }
     
@@ -472,8 +473,7 @@ void update_IO()
   // turn off all relays when the device is not PAIRED
   if (pairingStatus != PAIR_PAIRED && pair_request_attempts >= 150) {
     // after 150 attempts of connection with the server. (approx. 5 min)
-    set_compressor_state(false);
-    set_fan_state(false);
+    settings_data.system_state = UNKN;
     return;
   }
 
@@ -501,7 +501,7 @@ void update_IO()
     const float off_value = settings_data.system_temp_sp - 0.5; // -0.5
 
     //- fan mode function.
-    if (settings_data.system_mode == FAN_MODE) {
+    if (settings_data.peers_mode == FAN_MODE) {
       // turn on the fan only.
       set_fan_state(true);
       set_compressor_state(false);
@@ -509,7 +509,7 @@ void update_IO()
     }
 
     // cool mode or auto mode.
-    if (settings_data.system_mode == COOL_MODE) {
+    if (settings_data.peers_mode== COOL_MODE) {
       // cooling mode state.
       // turn on the fan allways.
       set_fan_state(true);
@@ -523,15 +523,14 @@ void update_IO()
       return;
     }
 
-    if (settings_data.system_mode == AUTO_MODE) {
-
-      set_fan_state(true);
-      // turn on the fan allways.
-      
+    if (settings_data.peers_mode == AUTO_MODE) {
+      // in auto mode, the fan follows the compressor state
       if (air_return_temp <= off_value) {
         set_compressor_state(false);
+        set_fan_state(false);
       } else if (air_return_temp >= on_value){
         set_compressor_state(true & float_sw_state);
+        set_fan_state(true);
       }
 
       return;
@@ -548,11 +547,11 @@ void update_IO()
 void load_hourmeter_from_fs() {
   info_logger("-> loading hourmeter from fs");
   JsonDocument json;
-  String hourmeter_data = load_data_from_fs("/hourmeter.txt");
+  const char* hourmeter_data = load_data_from_fs("/hourmeter.txt");
 
   DeserializationError error = deserializeJson(json, hourmeter_data);
   if (error) {
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
+    ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
     return;
   }
 
@@ -570,13 +569,13 @@ void update_hourmeter_in_fs() {
   const char * target_file = "/hourmeter.txt";
   JsonDocument json;
   JsonDocument new_json;
-  String new_hourmeter;
-  String hourmeter_data = load_data_from_fs(target_file);
+  char new_hourmeter[256];
+  const char* hourmeter_data = load_data_from_fs(target_file);
 
   DeserializationError error = deserializeJson(json, hourmeter_data);
   if (error)
   {
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
+    ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
     return;
   }
 
@@ -603,8 +602,8 @@ void update_time_counter() {
 
   currentMillis = millis();
 
-  if (!fan_state) {
-    //nothing to count when the fan is off.
+  if (settings_data.system_state != SYSTEM_ON) {
+    //nothing to count when the system state is not on.
     return;
   }
   
@@ -612,14 +611,14 @@ void update_time_counter() {
     //1 second count
     lastSecondTick = currentMillis;
 
-    if (compressor_state) {
-      compressorRunningSeconds ++; // sum 1 second to the counter.
+    systemRunningSeconds ++;
+    if (systemRunningSeconds >= 60) { // every minute.
+      systemRunningSeconds = 0;
+      update_hourmeter_in_fs();
     }
 
-    fanRunningSeconds ++;
-    if (fanRunningSeconds >= 60) { // every minute.
-      fanRunningSeconds = 0;
-      update_hourmeter_in_fs();
+    if (compressor_state) {
+      compressorRunningSeconds ++; // sum 1 second to the counter.
     }
   }
 
@@ -627,15 +626,15 @@ void update_time_counter() {
 }
 
 //- *esp_now functions
-bool add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
+esp_err_t add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   info_logger("[esp-now] adding new peer to peer list.");
 
   if (channel <= 0 || channel > MAX_CHANNEL) {
-    error_logger("invalid channel value received. peer not added");
-    return false;
+    ESP_LOGE(TAG, "invalid channel value received. peer not added");
+    return ESP_FAIL;
   }
 
-  ESP_LOG_LEVEL(ESP_LOG_DEBUG, TAG, "MAC: %s, channel: %d.", print_device_mac(mac_addr).c_str(), channel);
+  ESP_LOGD(TAG, "MAC: %s, channel: %d.", print_device_mac(mac_addr), channel);
   //- set to 0 all data of the peerTemplate var.
   memset(&server_peer, 0, sizeof(esp_now_peer_info_t));
 
@@ -648,7 +647,14 @@ bool add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   // delete existing peer.
   if (esp_now_is_peer_exist(server_peer.peer_addr)) {
     debug_logger("peer already exists. deleting old data.");
-    esp_now_del_peer(server_peer.peer_addr);
+    esp_err_t deleteStatus = esp_now_del_peer(server_peer.peer_addr);
+    if (deleteStatus == ESP_OK) {
+        ESP_LOGI(TAG, "server-peer deleted!");
+
+    } else {
+        ESP_LOGE(TAG, "error deleting server-peer!");
+        return ESP_FAIL;
+    }
   }
   // save peer in peerlist
   esp_err_t result = esp_now_add_peer(&server_peer);
@@ -661,36 +667,36 @@ bool add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   {
   case ESP_OK:
     info_logger("New peer added successfully!..");
-    return true;
+    return ESP_OK;
   
   default:
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "Error: %d, while adding new peer.", esp_err_to_name(result));
-    return false;
+    ESP_LOGE(TAG, "Error: %d, while adding new peer.", esp_err_to_name(result));
+    return ESP_FAIL;
   }
 }
 
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   //- callback.
-  String device_id = print_device_mac(mac_addr);
+  const char* device_id = print_device_mac(tx_info->des_addr);
   switch (status)
   {
   case ESP_NOW_SEND_SUCCESS:
-    ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "[esp-now] packet to: %s has been sent!", device_id.c_str());
+    ESP_LOGI(TAG, "[esp-now] packet to: %s has been sent!", device_id);
     break;
   
   default:
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] packet to: %s not sent.", device_id.c_str());
+    ESP_LOGE(TAG, "[esp-now] packet to: %s not sent.", device_id);
     break;
   }
 }
 
-void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) { 
+void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t * incomingData, int len) { 
   //-
-  String mac_str = print_device_mac(mac_addr);
-  String sender_serial = print_device_serial(mac_addr);
-  String server_serial = print_device_serial(server_peer.peer_addr);
+  const char* mac_str = print_device_mac(rcv_info->src_addr);
+  const char* sender_serial = print_device_serial(rcv_info->src_addr);
+  const char* server_serial = print_device_serial(server_peer.peer_addr);
 
-  ESP_LOG_LEVEL(ESP_LOG_INFO, TAG, "[esp-now] %d bytes of data received from: %s", len, mac_str.c_str());
+  ESP_LOGI(TAG, "[esp-now] %d bytes of data received from: %s", len, mac_str);
 
   //only accept messages from server device.
   uint8_t message_type = incomingData[0];
@@ -728,12 +734,12 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
     info_logger("[esp-now] message of type PAIRING received");
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
     // add peer to peer list.
-    if (!add_peer_to_plist(mac_addr, pairing_data.channel)){ // the server decides the channel.
-      error_logger("[esp-now] server peer couldn't be saved, try again.");
+    if (!add_peer_to_plist(rcv_info->src_addr, pairing_data.channel)){ // the server decides the channel.
+      ESP_LOGE(TAG, "[esp-now] server peer couldn't be saved, try again.");
       break;
     }
     // save server data in fs.
-    save_server_in_fs(mac_addr, pairing_data.channel); // update server info in fs.
+    save_server_in_fs(rcv_info->src_addr, pairing_data.channel); // update server info in fs.
     
     // device PAIRED with server.
     char buff[100] = "";
@@ -755,7 +761,7 @@ void log_on_result(esp_err_t result) {
     break;
   
   default:
-    ESP_LOG_LEVEL(ESP_LOG_ERROR, TAG, "[esp-now] error sending msg to peer, reason: %s",  esp_err_to_name(result));
+    ESP_LOGE(TAG, "[esp-now] error sending msg to peer, reason: %s",  esp_err_to_name(result));
     break;
   }
 
@@ -765,19 +771,18 @@ void log_on_result(esp_err_t result) {
 void system_logs() {
   currentMillis = millis();
   JsonDocument root;
-  String doc;
+  char doc[256];
 
   if (currentMillis - lastSystemLog >= SYSTEM_LOG_DELAY) {
     lastSystemLog = currentMillis;
     //- data
-    root["room_t"] = settings_data.room_temp;
     root["retu_t"] = air_return_temp;
     root["supp_t"] = air_supply_temp;
     root["sys_sp"] = settings_data.system_temp_sp;
     root["comp"] = compressor_state;
     root["fan"] = fan_state;
     root["sys_st"] = settings_data.system_state;
-    root["sys_mo"] = settings_data.system_mode;
+    root["sys_mo"] = settings_data.peers_mode;
     root["pair"] = pairingStatus;
     root["cr_cnt"] = compressorRunningSeconds;
     root["float"] = float_sw_state;
@@ -785,7 +790,7 @@ void system_logs() {
 
     //- output
     serializeJson(root, doc);
-    debug_logger(doc.c_str());
+    debug_logger(doc);
   }
 
   return;
@@ -812,7 +817,7 @@ void espnow_loop(){
   switch(pairingStatus) {
     // PAIR REQUEST
     case PAIR_REQUEST:
-      if (strcmp(SERIAL_DEFAULT, print_device_serial(server_mac_address).c_str()) == 0)
+      if (strcmp(SERIAL_DEFAULT, print_device_serial(server_mac_address)) == 0)
       {
         // check if no more attemps are allowed.
         if (pair_request_attempts >= MAX_PAIR_ATTEMPTS) {
@@ -833,7 +838,7 @@ void espnow_loop(){
 
       // add peer and send request
       if (!add_peer_to_plist(server_mac_address, radio_channel)){ // mac address stored in global var.
-        error_logger("[esp-now] couldn't add peer to peer list.");
+        ESP_LOGE(TAG, "[esp-now] couldn't add peer to peer list.");
         break;
       }
 
@@ -946,7 +951,7 @@ void setup() {
 
   // SPIFFS SETUP
   if(!SPIFFS.begin(true)) {
-    error_logger("Ocurrió un error al iniciar SPIFFS..");
+    ESP_LOGE(TAG, "Ocurrió un error al iniciar SPIFFS..");
     while (1){;}
   }
 
@@ -978,15 +983,15 @@ void setup() {
   uint8_t mac_buffer[6];
   esp_err_t ret = esp_wifi_get_mac(WIFI_IF_AP, mac_buffer);
   if (ret != ESP_OK) {
-    error_logger("could not read mac address.");
+    ESP_LOGE(TAG, "could not read mac address.");
   }
   //-
   if (esp_now_init() != ESP_OK) {
-    error_logger("-- Error initializing ESP-NOW, please reboot --");
+    ESP_LOGE(TAG, "-- Error initializing ESP-NOW, please reboot --");
     while (1){;}
   }
   esp_now_register_send_cb(OnDataSent);
-  esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
+  esp_now_register_recv_cb(OnDataRecv);
   //-done
   info_logger("[esp-now] settings done.");
 
