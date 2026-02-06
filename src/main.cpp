@@ -149,10 +149,8 @@ void info_logger(const char *message) {
 }
 
 // función que carga datos que contiene toda la información dentro del target_file del SPIFFS.
-const char* load_data_from_fs(const char *target_file) {
-  //-
-  static char buffer[256];
-  ESP_LOGD(TAG, "loading data from %s", target_file);
+char* load_data_from_fs(const char *target_file) {
+  static char buffer[1024]; // Buffer estático para evitar heap
   //-
   File f = SPIFFS.open(target_file);
   if (!f) {
@@ -161,22 +159,28 @@ const char* load_data_from_fs(const char *target_file) {
     return buffer;
   }
 
-  size_t size = f.size();
-  if (size >= sizeof(buffer)) size = sizeof(buffer) - 1;
-  f.readBytes(buffer, size);
-  buffer[size] = '\0';
-  f.close();
-  delay(100);
+  size_t len = f.size();
+  if (len >= sizeof(buffer)) {
+    ESP_LOGE(TAG, "Archivo demasiado grande para el buffer.");
+    f.close();
+    strcpy(buffer, "null");
+    return buffer;
+  }
 
-  //log
-  ESP_LOGD(TAG, "data loaded from SPIFFS: %s", buffer);
+  f.readBytes(buffer, len);
+  buffer[len] = '\0';
+  f.close();
+
+  ESP_LOGI(TAG, "data loaded from SPIFFS correctly");
+  ESP_LOGD(TAG, "data: %s", buffer);
   return buffer;
 }
-
 // función que guarda datos en el target_file del SPIFFS.
-void save_data_in_fs(const char *data_to_save, const char *target_file) {
+void save_data_in_fs(const char* data_to_save, const char* target_file) {
   //savin data in filesystem.
-  ESP_LOGD(TAG, "saving in:%s this data:%s", target_file, data_to_save);
+  ESP_LOGI(TAG, "saving data in SPIFFS");
+  ESP_LOGD(TAG, "target_file: %s", target_file);
+  ESP_LOGD(TAG, "data: %s", data_to_save);
 
   File f = SPIFFS.open(target_file, "w");
   if (!f){
@@ -186,9 +190,7 @@ void save_data_in_fs(const char *data_to_save, const char *target_file) {
 
   f.print(data_to_save);
   f.close();
-  debug_logger("data saved in SPIFFS!");
-  delay(100);
-
+  ESP_LOGI(TAG, "data saved correctly in SPIFFS.");
   return;
 }
 
@@ -412,7 +414,6 @@ void set_fan_state(bool new_state) {
     digitalWrite(FAN_RELAY, HIGH);
     lastFanTurnOn = currentMillis;
     fan_state = true;
-    lastSecondTick = currentMillis; // set lastSecondTick to currentMillis to count from this moment.
     return;
   }
   
@@ -474,6 +475,12 @@ void update_IO()
   if (pairingStatus != PAIR_PAIRED && pair_request_attempts >= 150) {
     // after 150 attempts of connection with the server. (approx. 5 min)
     settings_data.system_state = UNKN;
+    return;
+  }
+
+  if (settings_data.alarm_status != STATUS_OK) {
+    set_fan_state(false);
+    set_compressor_state(false);
     return;
   }
 
@@ -604,6 +611,7 @@ void update_time_counter() {
 
   if (settings_data.system_state != SYSTEM_ON) {
     //nothing to count when the system state is not on.
+    lastSecondTick = currentMillis;
     return;
   }
   
@@ -675,7 +683,7 @@ esp_err_t add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
   }
 }
 
-void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+void OnDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
   //- callback.
   const char* device_id = print_device_mac(tx_info->des_addr);
   switch (status)
