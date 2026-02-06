@@ -9,7 +9,7 @@ static const char* TAG = "main";
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <FS.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>
 #include <secrets.h>
 #include <ArduinoJson.h>
 
@@ -107,7 +107,7 @@ unsigned long lastCompressorTurnOff = 0;
 unsigned long lastFanTurnOn = 0;
 unsigned long lastSystemLog = 0;
 unsigned long lastSecondTick = 0;
-const unsigned long SYSTEM_LOG_DELAY = 1000L; // 1 second.
+const unsigned long SYSTEM_LOG_DELAY = 5000L; // 5 second.
 const unsigned long FAN_OFF_DELAY = 5000L; // 5 seconds off-delay.
 const unsigned long COMPRESSOR_ON_DELAY = 5000L; // 5 seconds on-delay.
 const unsigned long COMPRESSOR_SHORT_CYCLING_DELAY = 3L * 60000L; // 3 minutes for compressor short cycling prevention.
@@ -139,20 +139,11 @@ void network_led_pulse_effect() {
   }
 }
 
-//logger function
-void debug_logger(const char *message) {
-  ESP_LOGD(TAG, "%s", message);
-}
-
-void info_logger(const char *message) {
-  ESP_LOGI(TAG, "%s", message);
-}
-
 // función que carga datos que contiene toda la información dentro del target_file del SPIFFS.
 char* load_data_from_fs(const char *target_file) {
   static char buffer[1024]; // Buffer estático para evitar heap
   //-
-  File f = SPIFFS.open(target_file);
+  File f = LittleFS.open(target_file);
   if (!f) {
     ESP_LOGE(TAG, "Error al abrir el archivo solicitado.");
     strcpy(buffer, "null");
@@ -182,7 +173,7 @@ void save_data_in_fs(const char* data_to_save, const char* target_file) {
   ESP_LOGD(TAG, "target_file: %s", target_file);
   ESP_LOGD(TAG, "data: %s", data_to_save);
 
-  File f = SPIFFS.open(target_file, "w");
+  File f = LittleFS.open(target_file, "w");
   if (!f){
     ESP_LOGE(TAG, "Error al abrir el archivo solicitado.");
     return;
@@ -223,7 +214,7 @@ void parse_mac_address(const char* str, char sep, byte* bytes, int maxBytes, int
 }
 
 void set_defaults_in_fs(){
-  info_logger("saving server default values in the fs.");
+  ESP_LOGI(TAG,"saving server default values in the fs.");
   JsonDocument json_doc;
   char data[256];
 
@@ -242,7 +233,7 @@ void set_defaults_in_fs(){
 void save_server_in_fs(const uint8_t *new_mac_address, uint8_t new_channel) {
   //- save server info in spiffs.
 
-  info_logger("Saving new server data in the fs.");
+  ESP_LOGI(TAG,"Saving new server data in the fs.");
   JsonDocument server_json;
   char data[256];
   
@@ -259,7 +250,7 @@ void save_server_in_fs(const uint8_t *new_mac_address, uint8_t new_channel) {
 
 //- load server mac address from filesystem.
 void load_server_from_fs() {
-  info_logger("Loading server data from fs.");
+  ESP_LOGI(TAG,"Loading server data from fs.");
 
   JsonDocument server_json;
   const char* server_data = load_data_from_fs("/now_server.txt");
@@ -304,14 +295,14 @@ void load_server_from_fs() {
   //- Set pairingStatus based on the server_serial loaded from fs.
   if (strcmp(server_ser, SERIAL_DEFAULT) == 0) {
     //- server address has never been set. configure idle mode for pairing process.
-    info_logger("[esp-now] server mac address is the default value.");
+    ESP_LOGI(TAG,"[esp-now] server mac address is the default value.");
     pairingStatus = NOT_PAIRED;
   } else {
-    info_logger("[esp-now] ready for esp-now communication with the server");
+    ESP_LOGI(TAG,"[esp-now] ready for esp-now communication with the server");
     pairingStatus = PAIR_REQUEST;
   }
 
-  info_logger("server data loaded from fs!");
+  ESP_LOGI(TAG,"server data loaded from fs!");
   return;
 }
 
@@ -371,7 +362,7 @@ void set_compressor_state(bool new_state){
 
   //- turn off the compressor
   if (new_state == false && compressor_state == true){
-    info_logger("turning off the compressor");
+    ESP_LOGI(TAG,"turning off the compressor");
     digitalWrite(COMP_RELAY, LOW);
     compressor_state = false;
     lastCompressorTurnOff = currentMillis;
@@ -393,7 +384,7 @@ void set_compressor_state(bool new_state){
 
     //- on_delay since Fan last turn ON.
     if (currentMillis - lastFanTurnOn >= COMPRESSOR_ON_DELAY) {
-      info_logger("turning on the compressor");
+      ESP_LOGI(TAG,"turning on the compressor");
       digitalWrite(COMP_RELAY, HIGH);
       compressor_state = true;
       compressorRunningSeconds = 0; // restart the counter.
@@ -410,7 +401,7 @@ void set_fan_state(bool new_state) {
 
   //- turn on the fan.
   if (new_state == true && fan_state == false){
-    info_logger("turning on the fan.");
+    ESP_LOGI(TAG,"turning on the fan.");
     digitalWrite(FAN_RELAY, HIGH);
     lastFanTurnOn = currentMillis;
     fan_state = true;
@@ -427,7 +418,7 @@ void set_fan_state(bool new_state) {
 
     // off delay time after the compressor last turn off.
     if (currentMillis - lastCompressorTurnOff >= FAN_OFF_DELAY) {
-      info_logger("turning off the fan.");
+      ESP_LOGI(TAG,"turning off the fan.");
       digitalWrite(FAN_RELAY, LOW);
       fan_state = false;
       return;
@@ -552,7 +543,7 @@ void update_IO()
 
 
 void load_hourmeter_from_fs() {
-  info_logger("-> loading hourmeter from fs");
+  ESP_LOGI(TAG,"-> loading hourmeter from fs");
   JsonDocument json;
   const char* hourmeter_data = load_data_from_fs("/hourmeter.txt");
 
@@ -572,7 +563,7 @@ void update_hourmeter_in_fs() {
 
   // call this function every minute.
 
-  info_logger("updating hourmeter in fs.");
+  ESP_LOGI(TAG,"updating hourmeter in fs.");
   const char * target_file = "/hourmeter.txt";
   JsonDocument json;
   JsonDocument new_json;
@@ -635,7 +626,7 @@ void update_time_counter() {
 
 //- *esp_now functions
 esp_err_t add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
-  info_logger("[esp-now] adding new peer to peer list.");
+  ESP_LOGI(TAG,"[esp-now] adding new peer to peer list.");
 
   if (channel <= 0 || channel > MAX_CHANNEL) {
     ESP_LOGE(TAG, "invalid channel value received. peer not added");
@@ -654,7 +645,7 @@ esp_err_t add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
 
   // delete existing peer.
   if (esp_now_is_peer_exist(server_peer.peer_addr)) {
-    debug_logger("peer already exists. deleting old data.");
+    ESP_LOGD(TAG,"peer already exists. deleting old data.");
     esp_err_t deleteStatus = esp_now_del_peer(server_peer.peer_addr);
     if (deleteStatus == ESP_OK) {
         ESP_LOGI(TAG, "server-peer deleted!");
@@ -669,12 +660,12 @@ esp_err_t add_peer_to_plist(const uint8_t * mac_addr, uint8_t channel){
 
   //- update WiFi channel.
   ESP_ERROR_CHECK(esp_wifi_set_channel(channel,  WIFI_SECOND_CHAN_NONE));
-  info_logger("WiFi channel updated!");
+  ESP_LOGI(TAG,"WiFi channel updated!");
 
   switch (result)
   {
   case ESP_OK:
-    info_logger("New peer added successfully!..");
+    ESP_LOGI(TAG,"New peer added successfully!..");
     return ESP_OK;
   
   default:
@@ -711,7 +702,7 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t * incomingDat
   uint8_t sender_role = incomingData[1];
 
   if (sender_role != SERVER) {
-    info_logger("[esp-now] invalid device role. ignoring message");
+    ESP_LOGI(TAG,"[esp-now] invalid device role. ignoring message");
     return;
   }
 
@@ -723,15 +714,15 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t * incomingDat
     //- DATA type
     //- validations
     if (pairingStatus != PAIR_PAIRED) {
-      info_logger("device not paired yet! ignoring data.");
+      ESP_LOGI(TAG,"device not paired yet! ignoring data.");
       break;
     }
     if (sender_serial != server_serial) {
-      info_logger("message received from an unknown device, ignoring data.");
+      ESP_LOGI(TAG,"message received from an unknown device, ignoring data.");
       break;
     }
     //- ingest incoming data.
-    info_logger("[esp-now] message of type DATA received");
+    ESP_LOGI(TAG,"[esp-now] message of type DATA received");
     memcpy(&settings_data, incomingData, sizeof(settings_data));
     postEspnowFlag = true; // flag to send a response to the server.
     //-
@@ -739,10 +730,10 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t * incomingDat
 
   case PAIRING:    // received pairing data from server
     //- PAIRING type
-    info_logger("[esp-now] message of type PAIRING received");
+    ESP_LOGI(TAG,"[esp-now] message of type PAIRING received");
     memcpy(&pairing_data, incomingData, sizeof(pairing_data));
     // add peer to peer list.
-    if (!add_peer_to_plist(rcv_info->src_addr, pairing_data.channel)){ // the server decides the channel.
+    if (add_peer_to_plist(rcv_info->src_addr, pairing_data.channel) != ESP_OK){ // the server decides the channel.
       ESP_LOGE(TAG, "[esp-now] server peer couldn't be saved, try again.");
       break;
     }
@@ -750,9 +741,7 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t * incomingDat
     save_server_in_fs(rcv_info->src_addr, pairing_data.channel); // update server info in fs.
     
     // device PAIRED with server.
-    char buff[100] = "";
-    sprintf(buff, "device paired on channel %d after %d attempts", radio_channel, pair_request_attempts);
-    info_logger(buff);
+    ESP_LOGI(TAG,"device paired on channel %d after %d attempts", radio_channel, pair_request_attempts);
     pair_request_attempts = 0;
     pairingStatus = PAIR_PAIRED;  // set the pairing status
     //-
@@ -765,7 +754,7 @@ void log_on_result(esp_err_t result) {
   switch (result)
   {
   case ESP_OK:
-    info_logger("[esp-now] message to the server has been sent.");
+    ESP_LOGI(TAG,"[esp-now] message to the server has been sent.");
     break;
   
   default:
@@ -787,18 +776,13 @@ void system_logs() {
     root["retu_t"] = air_return_temp;
     root["supp_t"] = air_supply_temp;
     root["sys_sp"] = settings_data.system_temp_sp;
-    root["comp"] = compressor_state;
-    root["fan"] = fan_state;
     root["sys_st"] = settings_data.system_state;
     root["sys_mo"] = settings_data.peers_mode;
     root["pair"] = pairingStatus;
-    root["cr_cnt"] = compressorRunningSeconds;
-    root["float"] = float_sw_state;
-    root["hourmt"] = hourmeter_count;
 
     //- output
     serializeJson(root, doc);
-    debug_logger(doc);
+    ESP_LOGD(TAG,"%s", doc);
   }
 
   return;
@@ -815,7 +799,7 @@ void espnow_loop(){
     //-
     set_defaults_in_fs();
     //-
-    info_logger("ESP restart...");
+    ESP_LOGI(TAG,"ESP restart...");
     digitalWrite(NETWORK_LED, HIGH);
     delay(1000);
     ESP.restart();
@@ -832,12 +816,12 @@ void espnow_loop(){
           // ends pairing process.
           pairingStatus = NOT_PAIRED;
           pair_request_attempts = 0;
-          info_logger("auto-pairing process couln't find the server.");
+          ESP_LOGI(TAG,"auto-pairing process FINISHED... couln't find the server.");
           break;
         }
       }
       pair_request_attempts ++;
-      ESP_LOG_LEVEL(LOG_LOCAL_LEVEL, TAG, "Sending PR# %d on channel: %d", pair_request_attempts, radio_channel);
+      ESP_LOGD(TAG, "Sending PR# %d on channel: %d", pair_request_attempts, radio_channel);
     
       // set pairing data to send to the server
       pairing_data.msg_type = PAIRING;
@@ -845,8 +829,9 @@ void espnow_loop(){
       pairing_data.channel = radio_channel;
 
       // add peer and send request
-      if (!add_peer_to_plist(server_mac_address, radio_channel)){ // mac address stored in global var.
+      if (add_peer_to_plist(server_mac_address, radio_channel != ESP_OK)){ // mac address stored in global var.
         ESP_LOGE(TAG, "[esp-now] couldn't add peer to peer list.");
+        pairingStatus = NOT_PAIRED;
         break;
       }
 
@@ -869,7 +854,7 @@ void espnow_loop(){
 
       // time out to allow receiving response from server
       if(currentMillis - lastPairingRequest > ESP_NOW_WAIT_PAIR_RESPONSE) {
-        info_logger("[autopairing] time out expired, try on the next channel");
+        ESP_LOGI(TAG,"[autopairing] time out expired, try on the next channel");
         radio_channel ++;
         if (radio_channel > MAX_CHANNEL){
           radio_channel = 1;
@@ -904,7 +889,7 @@ void espnow_loop(){
       }
 
       if (currentMillis - lastEspnowReceived >= ESP_NOW_WAIT_SERVER_MSG) {
-        info_logger("Timeout since last server message received. Setting up PR Mode.");
+        ESP_LOGI(TAG,"Timeout since last server message received. Setting up PR Mode.");
         pairingStatus = PAIR_REQUEST;
       }
 
@@ -940,12 +925,18 @@ void espnow_loop(){
 // -setup
 void setup() {
   // SETUP BEGIN
-  esp_log_level_set("*", ESP_LOG_DEBUG); 
-  Serial.begin(115200); 
-  debug_logger("** setup start. **");
+  Serial.begin(115200);
+  esp_log_level_set(TAG, ESP_LOG_DEBUG); //set all logger on debug.
+  ESP_LOGD(TAG, "** setup start. **");
+
+  #ifndef ESP32
+  while (!Serial)
+    ; // wait for serial port to connect. Needed for native USB
+  #endif
+
 
   //PINS SETUP
-  info_logger("pins settings");
+  ESP_LOGI(TAG,"pins settings");
   pinMode(AUTO_RELAY, OUTPUT);
   pinMode(FAN_RELAY, OUTPUT);
   pinMode(COMP_RELAY, OUTPUT);
@@ -955,16 +946,16 @@ void setup() {
   pinMode(Q1_INPUT, INPUT_PULLUP);
   pinMode(FLOAT_SWTCH, INPUT);
   pinMode(NOW_CNF, INPUT);
-  info_logger("pins settings done.");
+  ESP_LOGI(TAG,"pins settings done.");
 
   // SPIFFS SETUP
-  if(!SPIFFS.begin(true)) {
+  if(!LittleFS.begin(true)) {
     ESP_LOGE(TAG, "Ocurrió un error al iniciar SPIFFS..");
     while (1){;}
   }
 
   // OneWire SETUP
-  info_logger("OneWire sensors settings!");
+  ESP_LOGI(TAG,"OneWire sensors settings!");
   air_return_sensor.begin();
   air_return_sensor.setResolution(tempSensorResolution);
   air_return_sensor.setWaitForConversion(false);
@@ -976,18 +967,18 @@ void setup() {
   air_supply_sensor.requestTemperatures();
   lastTempRequest = millis();
   tempRequestDelay = 750 / (1 << (12 - tempSensorResolution));
-  info_logger("OneWire sensors settings done.");
+  ESP_LOGI(TAG,"OneWire sensors settings done.");
 
   //- WiFi SETUP
-  info_logger("WiFi settings.");
+  ESP_LOGI(TAG,"WiFi settings.");
   WiFi.mode(WIFI_MODE_STA);
-  info_logger("MAC Address:  ->");
-  info_logger(WiFi.macAddress().c_str());
+  ESP_LOGI(TAG,"MAC Address:  ->");
+  ESP_LOGI(TAG,"%s", WiFi.macAddress().c_str());
   WiFi.disconnect();
-  info_logger("WiFi settings done.");
+  ESP_LOGI(TAG,"WiFi settings done.");
 
   //- ESP-NOW SETUP
-  info_logger("esp-now settings");
+  ESP_LOGI(TAG,"esp-now settings");
   uint8_t mac_buffer[6];
   esp_err_t ret = esp_wifi_get_mac(WIFI_IF_AP, mac_buffer);
   if (ret != ESP_OK) {
@@ -1001,7 +992,7 @@ void setup() {
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
   //-done
-  info_logger("[esp-now] settings done.");
+  ESP_LOGI(TAG,"[esp-now] settings done.");
 
   //LOAD DATA FROM FS
   load_server_from_fs();
@@ -1011,7 +1002,7 @@ void setup() {
   lastCompressorTurnOff = currentMillis;
 
   // SETUP FINISHED
-  info_logger("setup finished --!.");
+  ESP_LOGI(TAG,"setup finished --!.");
   delay(500);
 }
 
@@ -1021,5 +1012,5 @@ void loop() {
   update_IO();
   update_time_counter();
   espnow_loop();
-  // system_logs();
+  system_logs();
 }
