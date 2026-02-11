@@ -67,7 +67,7 @@ typedef struct {
   bool cooling_relay;      // (1 byte)
   bool fan_relay;          // (1 byte)
   unsigned int seconds_since_last_cooling_rq;  // (4 bytes) seconds since last false->true relay change.
-  unsigned int total_system_hours; // (4 bytes) total system running hours. state lives in the controller device.
+  unsigned int total_fan_hours; // (4 bytes) total system running hours. state lives in the controller device.
 } controller_data_struct;  // TOTAL = 18 bytes
 
 typedef struct {
@@ -907,7 +907,7 @@ void espnow_loop(){
         outgoing_data.cooling_relay = compressor_state;
         outgoing_data.fan_relay = fan_state;
         outgoing_data.seconds_since_last_cooling_rq = compressorRunningSeconds;
-        outgoing_data.total_system_hours = hourmeter_count;
+        outgoing_data.total_fan_hours = hourmeter_count;
 
         send_result = esp_now_send(server_peer.peer_addr, (uint8_t *) &outgoing_data, sizeof(outgoing_data));
         log_on_result(send_result);
@@ -926,7 +926,7 @@ void espnow_loop(){
 void setup() {
   // SETUP BEGIN
   Serial.begin(115200);
-  esp_log_level_set(TAG, ESP_LOG_DEBUG); //set all logger on debug.
+  esp_log_level_set(TAG, ESP_LOG_INFO); //set all logger on info.
   ESP_LOGD(TAG, "** setup start. **");
 
   #ifndef ESP32
