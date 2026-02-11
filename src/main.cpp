@@ -95,7 +95,7 @@ pairing_data_struct pairing_data;
 
 // time vars.
 unsigned int compressorRunningSeconds = 0; // seconds since last cooling request.
-unsigned int systemRunningSeconds = 0; // total cooling request counter.
+unsigned int fanRunningSeconds = 0; // total cooling request counter.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0;   // Stores last time data was published
 unsigned long lastPairingRequest = 0;
@@ -600,8 +600,8 @@ void update_time_counter() {
 
   currentMillis = millis();
 
-  if (settings_data.system_state != SYSTEM_ON) {
-    //nothing to count when the system state is not on.
+  if (!fan_state) {
+    //nothing to count when the fan is in off state.
     lastSecondTick = currentMillis;
     return;
   }
@@ -610,9 +610,9 @@ void update_time_counter() {
     //1 second count
     lastSecondTick = currentMillis;
 
-    systemRunningSeconds ++;
-    if (systemRunningSeconds >= 60) { // every minute.
-      systemRunningSeconds = 0;
+    fanRunningSeconds ++;
+    if (fanRunningSeconds >= 60) { // every minute.
+      fanRunningSeconds = 0;
       update_hourmeter_in_fs();
     }
 
