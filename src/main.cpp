@@ -14,9 +14,9 @@ static const char *TAG = "main";
 #include <ArduinoJson.h>
 
 // pinout
-#define AUTO_RELAY 18
 #define FAN_RELAY 17
-#define COMP_RELAY 16
+#define COMPRESSOR_RELAY 16
+#define ALARM_RELAY 18
 #define NETWORK_LED 2
 #define Q3_INPUT 14
 #define Q2_INPUT 27
@@ -25,8 +25,6 @@ static const char *TAG = "main";
 #define SUPPLY_TEMP 33
 #define FLOAT_SWTCH 32
 #define NOW_CNF 35
-// Set your Board ID
-#define BOARD_ID 1
 #define MAX_CHANNEL 11 // for North America
 
 // oneWire and DallasTemperature
@@ -47,6 +45,25 @@ uint8_t server_mac_address[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 int radio_channel = 1; // esp-now communication channel.
 int pair_request_attempts = 0;
 bool postEspnowFlag = false;
+
+enum AlarmCode
+{
+  UNKNOWN_ALARM = -1,
+  NORMAL,
+  HIGH_DISCHARGE_TEMP,
+  HIGH_LIQUID_TEMP,
+  HIGH_EXTERIOR_TEMP,
+  HIGH_PRESSURE_SWITCH,
+  HIGH_COMPRESSOR_CURRENT,
+  HIGH_AC_MAINS_VOLTAGE,
+  LOW_VAPOR_TEMP,
+  LOW_ENTHALPY,
+  LOW_PRESSURE_SWITCH,
+  LOW_AC_MAINS_VOLTAGE,
+  LOW_EVAP_DELTA_T,
+  DRAIN_SWITCH_OPEN,
+  COMPRESSOR_STALL,
+};
 
 enum PeerRoleID
 {
@@ -91,39 +108,39 @@ PairingStatusEnum pairingStatus = NOT_PAIRED;
 
 typedef struct
 {
-  MessageTypeEnum msg_type;                   // (1 byte)
-  PeerRoleID sender_role;                     // (1 byte)
-  int fault_code;                             // (1 byte)
-  float air_return_temp;                      // (4 bytes) [°C]
-  float air_supply_temp;                      // (4 bytes) [°C]
-  bool drain_switch;                          // (1 byte)
-  bool cooling_relay;                         // (1 byte)
-  bool fan_relay;                             // (1 byte)
-  unsigned int seconds_since_last_cooling_rq; // (4 bytes) seconds since last false->true relay change.
-} controller_data_struct;                     // TOTAL = 14 bytes
+  MessageTypeEnum msg_type;                   //
+  PeerRoleID sender_role;                     //
+  AlarmCode alarm_code;                       //  alarm_code_state... enum value... alarm detected in the controller device.
+  float air_return_temp;                      //  [°C]
+  float air_supply_temp;                      //  [°C]
+  bool drain_switch;                          //
+  bool cooling_relay;                         //
+  bool fan_relay;                             //
+  unsigned int seconds_since_last_cooling_rq; //  seconds since last false->true relay change.
+} controller_data_struct;                     //
 
 typedef struct
 {
-  MessageTypeEnum msg_type;   // (1 byte)
-  PeerRoleID sender_role;     // (1 byte)
-  SysModeEnum peers_mode;     // (1 byte)
-  SysStateEnum system_state;  // (1 byte)
-  float system_temp_sp;       // (4 bytes) [°C]
-  SysStatusFlag alarm_status; // (1 byte) - controls if the relays are enabled or not
-} incoming_settings_struct;   // TOTAL = 13 bytes
+  SysModeEnum peers_mode;    // (1 byte)
+  SysStateEnum system_state; // (1 byte)
+  AlarmCode alarm_code;      // (1 byte)
+  float system_temp_sp;      // (4 bytes) [°C]
+  float room_temp;           // (4 bytes) [°C] room temp value to be used as control temp if room_temp_control_en is true.
+  bool room_temp_control_en; // (1 byte) true if the system temp sp is based on the room temp, false if it's based on the return air temp.
+} incoming_settings_struct;  // TOTAL = 13 bytes
 
 typedef struct
 {
-  MessageTypeEnum msg_type;   // (1 byte)
-  PeerRoleID sender_role;     // (1 byte)
-  PeerRoleID device_new_role; // (1 byte)
-  int channel;                // (1 byte) - 0 is default, let this value for future changes.
-} pairing_data_struct;        // TOTAL = 9 bytes
+  MessageTypeEnum msg_type;   // tipo de mensaje (PAIR)
+  PeerRoleID sender_role;     //
+  PeerRoleID device_new_role; //
+  int channel;                //  - 0 is default, let this value for future changes.
+} pairing_data_struct;        //
 
 // Create 2 struct_message
-controller_data_struct outgoing_data;             // data to send
-incoming_settings_struct settings_data = {        // initial values.
-    DATA, SERVER, FAN_MODE, UNKN, 24, STATUS_OK}; // data received from server
+controller_data_struct outgoing_data;       // data to send
+incoming_settings_struct settings_data = {  // initial values.
+    FAN_MODE, UNKN, NORMAL, 24, 24, false}; // data received from server
 pairing_data_struct pairing_data;
 
 // time vars.
@@ -159,8 +176,7 @@ int led_fade_amount = 5;
 unsigned int hourmeter_count = 0;
 bool compressor_state = false;
 bool fan_state = false;
-uint8_t ret_sensor_fcode = 0;
-uint8_t sup_sensor_fcode = 0;
+AlarmCode calculated_alarm_code = NORMAL;
 
 //-
 void network_led_pulse_effect()
@@ -204,6 +220,7 @@ char *load_data_from_fs(const char *target_file)
   ESP_LOGD(TAG, "data: %s", buffer);
   return buffer;
 }
+
 // función que guarda datos en el target_file del SPIFFS.
 void save_data_in_fs(const char *data_to_save, const char *target_file)
 {
@@ -244,9 +261,10 @@ const char *print_device_serial(const uint8_t *mac_addr)
 }
 
 //- mac address parser
-void parse_mac_address(const char *str, char sep, byte *bytes, int maxBytes, int base)
+void parse_mac_address(const char *str, char sep, byte *bytes, int base)
 {
-  for (int i = 0; i < maxBytes; i++)
+  const int max_bytes = 6; // MAC addresses have 6 bytes
+  for (int i = 0; i < max_bytes; i++)
   {
     bytes[i] = strtoul(str, NULL, base); // Convert byte
     str = strchr(str, sep);              // Find next separator
@@ -334,7 +352,7 @@ void load_server_from_fs()
   memset(&server_peer, 0, sizeof(esp_now_peer_info_t));
 
   //-
-  parse_mac_address(server_mac_str, ':', server_mac_address, 6, 16);
+  parse_mac_address(server_mac_str, ':', server_mac_address, 16);
 
   //- update server_peer variable.
   memcpy(&server_peer.peer_addr, server_mac_address, sizeof(uint8_t[6]));
@@ -395,7 +413,6 @@ void update_temperature_readings()
     else
     {
       ESP_LOGE(TAG, "invalid reading on return sensor.");
-      ret_sensor_fcode = 0xF0;
     }
 
     if (is_valid_temp(supplyBuffer))
@@ -406,7 +423,6 @@ void update_temperature_readings()
     else
     {
       ESP_LOGE(TAG, "invalid reading on supply sensor.");
-      sup_sensor_fcode = 0x0F;
     }
 
     // request new readings.
@@ -418,18 +434,20 @@ void update_temperature_readings()
   return;
 }
 
-void set_compressor_state(bool new_state)
+void set_compressor_state(const bool rq_state)
 {
-
   currentMillis = millis();
+  const bool new_state = rq_state && float_sw_state;
+  // the compressor state request is true only if the float switch is closed and the request is true.
 
   //- turn off the compressor
   if (new_state == false && compressor_state == true)
   {
     ESP_LOGI(TAG, "turning off the compressor");
-    digitalWrite(COMP_RELAY, LOW);
+    digitalWrite(COMPRESSOR_RELAY, LOW);
     compressor_state = false;
     lastCompressorTurnOff = currentMillis;
+    compressorRunningSeconds = 0; // restart the counter.
     return;
   }
 
@@ -453,9 +471,8 @@ void set_compressor_state(bool new_state)
     if (currentMillis - lastFanTurnOn >= COMPRESSOR_ON_DELAY)
     {
       ESP_LOGI(TAG, "turning on the compressor");
-      digitalWrite(COMP_RELAY, HIGH);
+      digitalWrite(COMPRESSOR_RELAY, HIGH);
       compressor_state = true;
-      compressorRunningSeconds = 0; // restart the counter.
       return;
     }
   }
@@ -535,18 +552,19 @@ void update_IO()
   }
 
   //- outputs.
-  //- for now, AUTO_RELAY will allways be off...
-  digitalWrite(AUTO_RELAY, LOW);
+  //- for now, ALARM_RELAY will allways be off...
+  digitalWrite(ALARM_RELAY, LOW);
 
   // turn off all relays when the device is not PAIRED
   if (pairingStatus != PAIR_PAIRED && pair_request_attempts >= 150)
   {
     // after 150 attempts of connection with the server. (approx. 5 min)
-    settings_data.system_state = UNKN;
+    set_fan_state(false);
+    set_compressor_state(false);
     return;
   }
 
-  if (settings_data.alarm_status != STATUS_OK)
+  if (settings_data.alarm_code != AlarmCode::NORMAL)
   {
     set_fan_state(false);
     set_compressor_state(false);
@@ -573,9 +591,11 @@ void update_IO()
 
   case SYSTEM_ON:
     // system is on.
-    // turn on the compressor based on the return temp. value.
+    // turn on the compressor based on the return temp. value. 1 degree of hysteresis is set to avoid short cycling. (0.5 deg. on, 0.5 deg. off)
     const float on_value = settings_data.system_temp_sp + 0.5;  // +0.5 deg.
-    const float off_value = settings_data.system_temp_sp - 0.5; // -0.5
+    const float off_value = settings_data.system_temp_sp - 0.5; // -0.5 deg.
+    const float control_temp = settings_data.room_temp_control_en ? settings_data.room_temp : air_return_temp;
+    // control temp is based on the room temp or the return temp based on the settings received from the server.
 
     //- fan mode function.
     if (settings_data.peers_mode == FAN_MODE)
@@ -593,13 +613,13 @@ void update_IO()
       // turn on the fan allways.
       set_fan_state(true);
 
-      if (air_return_temp <= off_value)
+      if (control_temp <= off_value)
       {
         set_compressor_state(false);
       }
-      else if (air_return_temp >= on_value)
+      else if (control_temp >= on_value)
       {
-        set_compressor_state(true & float_sw_state);
+        set_compressor_state(true);
       }
 
       return;
@@ -608,14 +628,14 @@ void update_IO()
     if (settings_data.peers_mode == AUTO_MODE)
     {
       // in auto mode, the fan follows the compressor state
-      if (air_return_temp <= off_value)
+      if (control_temp <= off_value)
       {
         set_compressor_state(false);
         set_fan_state(false);
       }
-      else if (air_return_temp >= on_value)
+      else if (control_temp >= on_value)
       {
-        set_compressor_state(true & float_sw_state);
+        set_compressor_state(true);
         set_fan_state(true);
       }
 
@@ -629,72 +649,72 @@ void update_IO()
   return;
 }
 
-void load_hourmeter_from_fs()
-{
-  ESP_LOGI(TAG, "-> loading hourmeter from fs");
-  JsonDocument json;
-  const char *hourmeter_data = load_data_from_fs("/hourmeter.txt");
+// void load_hourmeter_from_fs()
+// {
+//   ESP_LOGI(TAG, "-> loading hourmeter from fs");
+//   JsonDocument json;
+//   const char *hourmeter_data = load_data_from_fs("/hourmeter.txt");
 
-  DeserializationError error = deserializeJson(json, hourmeter_data);
-  if (error)
-  {
-    ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
-    return;
-  }
+//   DeserializationError error = deserializeJson(json, hourmeter_data);
+//   if (error)
+//   {
+//     ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
+//     return;
+//   }
 
-  hourmeter_count = json["hours"] | 0;
+//   hourmeter_count = json["hours"] | 0;
 
-  return;
-}
+//   return;
+// }
 
-void update_hourmeter_in_fs()
-{
+// void update_hourmeter_in_fs()
+// {
 
-  // call this function every minute.
+//   // call this function every minute.
 
-  ESP_LOGI(TAG, "updating hourmeter in fs.");
-  const char *target_file = "/hourmeter.txt";
-  JsonDocument json;
-  JsonDocument new_json;
-  char new_hourmeter[256];
-  const char *hourmeter_data = load_data_from_fs(target_file);
+//   ESP_LOGI(TAG, "updating hourmeter in fs.");
+//   const char *target_file = "/hourmeter.txt";
+//   JsonDocument json;
+//   JsonDocument new_json;
+//   char new_hourmeter[256];
+//   const char *hourmeter_data = load_data_from_fs(target_file);
 
-  DeserializationError error = deserializeJson(json, hourmeter_data);
-  if (error)
-  {
-    ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
-    return;
-  }
+//   DeserializationError error = deserializeJson(json, hourmeter_data);
+//   if (error)
+//   {
+//     ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
+//     return;
+//   }
 
-  const int current_h = json["hours"] | 0;
-  const int current_m = json["minutes"] | 0;
+//   const int current_h = json["hours"] | 0;
+//   const int current_m = json["minutes"] | 0;
 
-  if (current_m < 59)
-  {
-    new_json["minutes"] = current_m + 1;
-    new_json["hours"] = current_h;
-  }
-  else
-  {
-    new_json["minutes"] = 0;
-    new_json["hours"] = current_h + 1;
-  }
+//   if (current_m < 59)
+//   {
+//     new_json["minutes"] = current_m + 1;
+//     new_json["hours"] = current_h;
+//   }
+//   else
+//   {
+//     new_json["minutes"] = 0;
+//     new_json["hours"] = current_h + 1;
+//   }
 
-  // update global value.
-  hourmeter_count = new_json["hours"];
+//   // update global value.
+//   hourmeter_count = new_json["hours"];
 
-  serializeJson(new_json, new_hourmeter);
-  save_data_in_fs(new_hourmeter, target_file);
-}
+//   serializeJson(new_json, new_hourmeter);
+//   save_data_in_fs(new_hourmeter, target_file);
+// }
 
 void update_time_counter()
 {
 
   currentMillis = millis();
 
-  if (!fan_state)
+  if (!compressor_state)
   {
-    // nothing to count when the fan is in off state.
+    // nothing to count when the compressor is in off state.
     lastSecondTick = currentMillis;
     return;
   }
@@ -702,19 +722,8 @@ void update_time_counter()
   if (currentMillis - lastSecondTick >= 1000)
   {
     // 1 second count
+    compressorRunningSeconds++; // sum 1 second to the counter.
     lastSecondTick = currentMillis;
-
-    fanRunningSeconds++;
-    if (fanRunningSeconds >= 60)
-    { // every minute.
-      fanRunningSeconds = 0;
-      update_hourmeter_in_fs();
-    }
-
-    if (compressor_state)
-    {
-      compressorRunningSeconds++; // sum 1 second to the counter.
-    }
   }
 
   return;
@@ -797,16 +806,31 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
   const char *mac_str = print_device_mac(rcv_info->src_addr);
   const char *sender_serial = print_device_serial(rcv_info->src_addr);
   const char *server_serial = print_device_serial(server_peer.peer_addr);
+  JsonDocument json_payload;
+  DeserializationError error = deserializeJson(json_payload, incomingData, len);
+  if (error)
+  {
+    ESP_LOGE(TAG, "Deserialization error raised with code: %s", error.c_str());
+    return;
+  }
 
   ESP_LOGI(TAG, "[esp-now] %d bytes of data received from: %s", len, mac_str);
 
   // only accept messages from server device.
-  uint8_t message_type = incomingData[0];
-  uint8_t sender_role = incomingData[1];
+  uint8_t message_type = json_payload["msg"] | 255; // 255 is an invalid message type that will be discarded.
+  uint8_t sender_role = json_payload["rol"] | 255;  // 255 is an invalid sender role that will be discarded.
 
   if (sender_role != SERVER)
   {
     ESP_LOGI(TAG, "[esp-now] invalid device role. ignoring message");
+    ESP_LOGD(TAG, "sender role: %d", sender_role);
+    return;
+  }
+
+  if (message_type != PAIRING && message_type != DATA)
+  {
+    ESP_LOGI(TAG, "[esp-now] invalid message type. ignoring message");
+    ESP_LOGD(TAG, "message type: %d", message_type);
     return;
   }
 
@@ -830,7 +854,15 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
     }
     //- ingest incoming data.
     ESP_LOGI(TAG, "[esp-now] message of type DATA received");
-    memcpy(&settings_data, incomingData, sizeof(settings_data));
+
+    // update global variable with the data received from the server.
+    settings_data.peers_mode = json_payload["glo"][0] | FAN_MODE;
+    settings_data.system_state = json_payload["glo"][1] | UNKN;
+    settings_data.alarm_code = json_payload["glo"][2] | NORMAL;
+    settings_data.system_temp_sp = json_payload["glo"][3] | 24;
+    settings_data.room_temp = json_payload["glo"][4] | 24;
+    settings_data.room_temp_control_en = json_payload["cnf"][0] | false;
+
     postEspnowFlag = true; // flag to send a response to the server.
     //-
     break;
@@ -838,7 +870,8 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
   case PAIRING: // received pairing data from server
     //- PAIRING type
     ESP_LOGI(TAG, "[esp-now] message of type PAIRING received");
-    memcpy(&pairing_data, incomingData, sizeof(pairing_data));
+    pairing_data.channel = json_payload["chan"] | radio_channel;
+
     // add peer to peer list.
     if (add_peer_to_plist(rcv_info->src_addr, pairing_data.channel) != ESP_OK)
     { // the server decides the channel.
@@ -884,12 +917,16 @@ void system_logs()
   {
     lastSystemLog = currentMillis;
     //- data
-    root["retu_t"] = air_return_temp;
-    root["supp_t"] = air_supply_temp;
-    root["sys_sp"] = settings_data.system_temp_sp;
-    root["sys_st"] = settings_data.system_state;
-    root["sys_mo"] = settings_data.peers_mode;
     root["pair"] = pairingStatus;
+    root["ret_t"] = air_return_temp;
+    root["sup_t"] = air_supply_temp;
+    root["sys_sp"] = settings_data.system_temp_sp;
+    root["sys_stt"] = settings_data.system_state;
+    root["sys_mod"] = settings_data.peers_mode;
+    root["rt_ctrl"] = settings_data.room_temp_control_en;
+    root["room_t"] = settings_data.room_temp;
+    root["alarm"] = settings_data.alarm_code;
+    root["calc_alarm"] = calculated_alarm_code;
 
     //- output
     serializeJson(root, doc);
@@ -944,7 +981,7 @@ void espnow_loop()
     pairing_data.channel = radio_channel;
 
     // add peer and send request
-    if (add_peer_to_plist(server_mac_address, radio_channel != ESP_OK))
+    if (add_peer_to_plist(server_mac_address, radio_channel) != ESP_OK)
     { // mac address stored in global var.
       ESP_LOGE(TAG, "[esp-now] couldn't add peer to peer list.");
       pairingStatus = NOT_PAIRED;
@@ -1023,7 +1060,7 @@ void espnow_loop()
       // Set values to send
       outgoing_data.msg_type = DATA;
       outgoing_data.sender_role = CONTROLLER;
-      outgoing_data.fault_code = ret_sensor_fcode | sup_sensor_fcode;
+      outgoing_data.alarm_code = calculated_alarm_code;
       outgoing_data.air_return_temp = air_return_temp;
       outgoing_data.air_supply_temp = air_supply_temp;
       outgoing_data.drain_switch = float_sw_state;
@@ -1033,8 +1070,6 @@ void espnow_loop()
 
       send_result = esp_now_send(server_peer.peer_addr, (uint8_t *)&outgoing_data, sizeof(outgoing_data));
       log_on_result(send_result);
-      ret_sensor_fcode = 0x00;
-      sup_sensor_fcode = 0x00;
     }
     //-
     break;
@@ -1059,9 +1094,9 @@ void setup()
 
   // PINS SETUP
   ESP_LOGI(TAG, "pins settings");
-  pinMode(AUTO_RELAY, OUTPUT);
+  pinMode(ALARM_RELAY, OUTPUT);
   pinMode(FAN_RELAY, OUTPUT);
-  pinMode(COMP_RELAY, OUTPUT);
+  pinMode(COMPRESSOR_RELAY, OUTPUT);
   pinMode(NETWORK_LED, OUTPUT);
   pinMode(Q3_INPUT, INPUT_PULLUP);
   pinMode(Q2_INPUT, INPUT_PULLUP);
@@ -1127,7 +1162,7 @@ void setup()
 
   // LOAD DATA FROM FS
   load_server_from_fs();
-  load_hourmeter_from_fs();
+  // load_hourmeter_from_fs();
 
   currentMillis = millis();
   lastCompressorTurnOff = currentMillis;
