@@ -137,7 +137,7 @@ typedef struct
   int channel;                //  - 0 is default, let this value for future changes.
 } pairing_data_struct;        //
 
-// Create 2 struct_message
+// Create structs
 controller_data_struct outgoing_data;       // data to send
 incoming_settings_struct settings_data = {  // initial values.
     FAN_MODE, UNKN, NORMAL, 24, 24, false}; // data received from server
@@ -145,7 +145,6 @@ pairing_data_struct pairing_data;
 
 // time vars.
 unsigned int compressorRunningSeconds = 0; // seconds since last cooling request.
-unsigned int fanRunningSeconds = 0;        // total cooling request counter.
 unsigned long lastTempRequest = 0;
 unsigned long lastEspnowReceived = 0; // Stores last time data was published
 unsigned long lastPairingRequest = 0;
@@ -161,7 +160,7 @@ const unsigned long SYSTEM_LOG_DELAY = 5000UL;                    // 5 second.
 const unsigned long FAN_OFF_DELAY = 5000UL;                       // 5 seconds off-delay.
 const unsigned long COMPRESSOR_ON_DELAY = 5000UL;                 // 5 seconds on-delay.
 const unsigned long COMPRESSOR_SHORT_CYCLING_DELAY = 3 * 60000UL; // 3 minutes for compressor short cycling prevention.
-const unsigned long ESP_NOW_POST_INTERVAL = 500UL;                // 0,5 seconds after receiving data from the server.
+const unsigned long ESP_NOW_POST_INTERVAL = 1000UL;               // 1 second after receiving data from the server.
 const unsigned long ESP_NOW_WAIT_SERVER_MSG = 1 * 60000UL;        // 1 minute for server message to arrive before PAIRING mode is set.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000UL;          // Interval to wait for pairing response from server
 const unsigned long BTN_DEBOUNCE_TIME = 100UL;                    // 100ms rebound time constant;
@@ -173,7 +172,6 @@ bool float_sw_state = false;
 bool last_float_sw_state = false;
 int led_brightness = 0;
 int led_fade_amount = 5;
-unsigned int hourmeter_count = 0;
 bool compressor_state = false;
 bool fan_state = false;
 AlarmCode calculated_alarm_code = NORMAL;
@@ -447,7 +445,6 @@ void set_compressor_state(const bool rq_state)
     digitalWrite(COMPRESSOR_RELAY, LOW);
     compressor_state = false;
     lastCompressorTurnOff = currentMillis;
-    compressorRunningSeconds = 0; // restart the counter.
     return;
   }
 
@@ -518,6 +515,25 @@ void set_fan_state(bool new_state)
   return;
 }
 
+AlarmCode calculate_alarm_code()
+{
+  //- calculate alarm code based on the sensor readings and the float switch state.
+  if (float_sw_state == false)
+  {
+    return AlarmCode::DRAIN_SWITCH_OPEN;
+  }
+
+  const float ev_delta_t = abs(air_return_temp - air_supply_temp);
+  if (compressorRunningSeconds > 600 && ev_delta_t < 4)
+  {
+    // if the compressor has been running for more than 10 minutes and the evaporator delta T
+    // is less than 4 degrees, it could be a sign of low refrigerant charge, a dirty evaporator coil or a bigger problem.
+    return AlarmCode::LOW_EVAP_DELTA_T;
+  }
+
+  return AlarmCode::NORMAL;
+}
+
 void update_IO()
 {
   currentMillis = millis();
@@ -551,6 +567,8 @@ void update_IO()
     float_sw_state = current_float_switch;
   }
 
+  calculated_alarm_code = calculate_alarm_code();
+
   //- outputs.
   //- for now, ALARM_RELAY will allways be off...
   digitalWrite(ALARM_RELAY, LOW);
@@ -564,14 +582,14 @@ void update_IO()
     return;
   }
 
-  if (settings_data.alarm_code != AlarmCode::NORMAL)
+  if (settings_data.alarm_code != AlarmCode::NORMAL || calculated_alarm_code != AlarmCode::NORMAL)
   {
     set_fan_state(false);
     set_compressor_state(false);
     return;
   }
 
-  switch (settings_data.system_state) // state received from server.
+  switch (settings_data.system_state) // state received from the server.
   {
   case UNKN:
     set_fan_state(false);
@@ -591,7 +609,7 @@ void update_IO()
 
   case SYSTEM_ON:
     // system is on.
-    // turn on the compressor based on the return temp. value. 1 degree of hysteresis is set to avoid short cycling. (0.5 deg. on, 0.5 deg. off)
+    // turn on the compressor based on the temp. value. 1 degree of hysteresis is set to avoid short cycling. (0.5 deg. on, 0.5 deg. off)
     const float on_value = settings_data.system_temp_sp + 0.5;  // +0.5 deg.
     const float off_value = settings_data.system_temp_sp - 0.5; // -0.5 deg.
     const float control_temp = settings_data.room_temp_control_en ? settings_data.room_temp : air_return_temp;
@@ -635,8 +653,8 @@ void update_IO()
       }
       else if (control_temp >= on_value)
       {
-        set_compressor_state(true);
         set_fan_state(true);
+        set_compressor_state(true);
       }
 
       return;
@@ -649,65 +667,7 @@ void update_IO()
   return;
 }
 
-// void load_hourmeter_from_fs()
-// {
-//   ESP_LOGI(TAG, "-> loading hourmeter from fs");
-//   JsonDocument json;
-//   const char *hourmeter_data = load_data_from_fs("/hourmeter.txt");
-
-//   DeserializationError error = deserializeJson(json, hourmeter_data);
-//   if (error)
-//   {
-//     ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
-//     return;
-//   }
-
-//   hourmeter_count = json["hours"] | 0;
-
-//   return;
-// }
-
-// void update_hourmeter_in_fs()
-// {
-
-//   // call this function every minute.
-
-//   ESP_LOGI(TAG, "updating hourmeter in fs.");
-//   const char *target_file = "/hourmeter.txt";
-//   JsonDocument json;
-//   JsonDocument new_json;
-//   char new_hourmeter[256];
-//   const char *hourmeter_data = load_data_from_fs(target_file);
-
-//   DeserializationError error = deserializeJson(json, hourmeter_data);
-//   if (error)
-//   {
-//     ESP_LOGE(TAG, "hourmeter Deserialization error raised with code: %s", error.c_str());
-//     return;
-//   }
-
-//   const int current_h = json["hours"] | 0;
-//   const int current_m = json["minutes"] | 0;
-
-//   if (current_m < 59)
-//   {
-//     new_json["minutes"] = current_m + 1;
-//     new_json["hours"] = current_h;
-//   }
-//   else
-//   {
-//     new_json["minutes"] = 0;
-//     new_json["hours"] = current_h + 1;
-//   }
-
-//   // update global value.
-//   hourmeter_count = new_json["hours"];
-
-//   serializeJson(new_json, new_hourmeter);
-//   save_data_in_fs(new_hourmeter, target_file);
-// }
-
-void update_time_counter()
+void update_compressor_runtime()
 {
 
   currentMillis = millis();
@@ -716,6 +676,7 @@ void update_time_counter()
   {
     // nothing to count when the compressor is in off state.
     lastSecondTick = currentMillis;
+    compressorRunningSeconds = 0; // restart the counter.
     return;
   }
 
@@ -866,7 +827,6 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
     postEspnowFlag = true; // flag to send a response to the server.
     //-
     break;
-
   case PAIRING: // received pairing data from server
     //- PAIRING type
     ESP_LOGI(TAG, "[esp-now] message of type PAIRING received");
@@ -942,7 +902,7 @@ void espnow_loop()
   currentMillis = millis();
   esp_err_t send_result;
 
-  if (now_btn_state && currentMillis - lastNowBtnChange > 10000L)
+  if (now_btn_state && currentMillis - lastNowBtnChange > 10000UL)
   {
     // after 10 seconds of now button pressed, default values will be set.
     lastNowBtnChange = currentMillis;
@@ -962,7 +922,9 @@ void espnow_loop()
   case PAIR_REQUEST:
     if (strcmp(SERIAL_DEFAULT, print_device_serial(server_mac_address)) == 0)
     {
-      // check if no more attemps are allowed.
+      // if the server mac address is the default value, it means that the device has never been paired with a server before, so it will try to pair with any server on each channel until it finds one or reaches the max attempts.
+      // the server will respond with its channel and mac address, so the device will save that information in the fs for future connections and set the correct channel for the esp-now communication.
+      // also, the server know the mac addresses of the allowed devices, so if the device that is trying to pair is not in the server's allow list, the server won't respond and the device will keep trying until it finds a server that allows it or reaches the max attempts.
       if (pair_request_attempts >= MAX_PAIR_ATTEMPTS)
       {
         // ends pairing process.
@@ -1177,7 +1139,7 @@ void loop()
   //-
   update_temperature_readings();
   update_IO();
-  update_time_counter();
+  update_compressor_runtime();
   espnow_loop();
   system_logs();
 }
