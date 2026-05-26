@@ -83,6 +83,7 @@ enum MessageTypeEnum
 {
   PAIRING,
   DATA,
+  CMD
 };
 enum SysModeEnum
 {
@@ -97,11 +98,11 @@ enum SysStateEnum
   SYSTEM_SLEEP,
   UNKN
 };
-enum SysStatusFlag
+enum CommandEnum
 {
-  STATUS_OK,
-  STATUS_WARNING,
-  STATUS_ERROR
+  EMPTY_CMD,
+  FAULT_RESTART,
+  ACTIVE_TEST
 };
 //-vars
 PairingStatusEnum pairingStatus = NOT_PAIRED;
@@ -160,7 +161,7 @@ const unsigned long SYSTEM_LOG_DELAY = 5000UL;                    // 5 second.
 const unsigned long FAN_OFF_DELAY = 5000UL;                       // 5 seconds off-delay.
 const unsigned long COMPRESSOR_ON_DELAY = 5000UL;                 // 5 seconds on-delay.
 const unsigned long COMPRESSOR_SHORT_CYCLING_DELAY = 3 * 60000UL; // 3 minutes for compressor short cycling prevention.
-const unsigned long ESP_NOW_POST_INTERVAL = 1000UL;               // 1 second after receiving data from the server.
+const unsigned long ESP_NOW_POST_INTERVAL = 500UL;                // 0.5 second after receiving data from the server.
 const unsigned long ESP_NOW_WAIT_SERVER_MSG = 1 * 60000UL;        // 1 minute for server message to arrive before PAIRING mode is set.
 const unsigned long ESP_NOW_WAIT_PAIR_RESPONSE = 2000UL;          // Interval to wait for pairing response from server
 const unsigned long BTN_DEBOUNCE_TIME = 100UL;                    // 100ms rebound time constant;
@@ -168,13 +169,14 @@ const unsigned long BTN_DEBOUNCE_TIME = 100UL;                    // 100ms rebou
 // gen vars
 bool now_btn_state = false;
 bool last_now_btn_state = false;
-bool float_sw_state = false;
-bool last_float_sw_state = false;
+bool float_sw_state = true;
+bool last_float_sw_state = true;
 int led_brightness = 0;
 int led_fade_amount = 5;
 bool compressor_state = false;
 bool fan_state = false;
-AlarmCode calculated_alarm_code = NORMAL;
+AlarmCode controller_alarm_code = NORMAL;
+bool restart_faults_flag = false;
 
 //-
 void network_led_pulse_effect()
@@ -517,6 +519,21 @@ void set_fan_state(bool new_state)
 
 AlarmCode calculate_alarm_code()
 {
+  if (restart_faults_flag)
+
+  {
+    restart_faults_flag = false; // reset flag.
+    // if the server sent a command to restart faults, the controller will reset the alarm code to NORMAL
+    // and the server will be able to detect if the alarm condition is still present or not based on the new readings sent by the controller after the reset.
+    controller_alarm_code = AlarmCode::NORMAL;
+  }
+
+  if (controller_alarm_code != AlarmCode::NORMAL)
+  {
+    // latch the alarm code until the server reset it, to make sure the alarm condition is not missed by the server.
+    return controller_alarm_code;
+  }
+
   //- calculate alarm code based on the sensor readings and the float switch state.
   if (float_sw_state == false)
   {
@@ -524,9 +541,9 @@ AlarmCode calculate_alarm_code()
   }
 
   const float ev_delta_t = abs(air_return_temp - air_supply_temp);
-  if (compressorRunningSeconds > 600 && ev_delta_t < 4)
+  if (compressorRunningSeconds > 300 && ev_delta_t < 4)
   {
-    // if the compressor has been running for more than 10 minutes and the evaporator delta T
+    // if the compressor has been running for more than 5 minutes and the evaporator delta T
     // is less than 4 degrees, it could be a sign of low refrigerant charge, a dirty evaporator coil or a bigger problem.
     return AlarmCode::LOW_EVAP_DELTA_T;
   }
@@ -567,23 +584,27 @@ void update_IO()
     float_sw_state = current_float_switch;
   }
 
-  calculated_alarm_code = calculate_alarm_code();
+  controller_alarm_code = calculate_alarm_code();
 
   //- outputs.
-  //- for now, ALARM_RELAY will allways be off...
-  digitalWrite(ALARM_RELAY, LOW);
+  // update alarm relay.
+  if (settings_data.alarm_code != AlarmCode::NORMAL || controller_alarm_code != AlarmCode::NORMAL)
+  {
+    // if there is an alarm condition, the system turns off the fan and the compressor as a safety measure.
+    set_fan_state(false);
+    set_compressor_state(false);
+    digitalWrite(ALARM_RELAY, HIGH);
+    return;
+  }
+  else
+  {
+    digitalWrite(ALARM_RELAY, LOW);
+  }
 
   // turn off all relays when the device is not PAIRED
   if (pairingStatus != PAIR_PAIRED && pair_request_attempts >= 150)
   {
     // after 150 attempts of connection with the server. (approx. 5 min)
-    set_fan_state(false);
-    set_compressor_state(false);
-    return;
-  }
-
-  if (settings_data.alarm_code != AlarmCode::NORMAL || calculated_alarm_code != AlarmCode::NORMAL)
-  {
     set_fan_state(false);
     set_compressor_state(false);
     return;
@@ -595,7 +616,6 @@ void update_IO()
     set_fan_state(false);
     set_compressor_state(false);
     break;
-    ;
 
   case SYSTEM_OFF:
     set_fan_state(false);
@@ -776,6 +796,7 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
   }
 
   ESP_LOGI(TAG, "[esp-now] %d bytes of data received from: %s", len, mac_str);
+  ESP_LOGD(TAG, "data received: %s", (char *)incomingData);
 
   // only accept messages from server device.
   uint8_t message_type = json_payload["msg"] | 255; // 255 is an invalid message type that will be discarded.
@@ -788,18 +809,12 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
     return;
   }
 
-  if (message_type != PAIRING && message_type != DATA)
-  {
-    ESP_LOGI(TAG, "[esp-now] invalid message type. ignoring message");
-    ESP_LOGD(TAG, "message type: %d", message_type);
-    return;
-  }
-
   lastEspnowReceived = millis(); // time of the last message received from the server.
 
   // get message_type message from first byte.
   switch (message_type)
   {
+
   case DATA: // we received data from server
     //- DATA type
     //- validations
@@ -822,11 +837,13 @@ void OnDataRecv(const esp_now_recv_info_t *rcv_info, const uint8_t *incomingData
     settings_data.alarm_code = json_payload["glo"][2] | NORMAL;
     settings_data.system_temp_sp = json_payload["glo"][3] | 24;
     settings_data.room_temp = json_payload["glo"][4] | 24;
+    restart_faults_flag = json_payload["glo"][5] | false;
     settings_data.room_temp_control_en = json_payload["cnf"][0] | false;
 
     postEspnowFlag = true; // flag to send a response to the server.
     //-
     break;
+
   case PAIRING: // received pairing data from server
     //- PAIRING type
     ESP_LOGI(TAG, "[esp-now] message of type PAIRING received");
@@ -867,7 +884,7 @@ void log_on_result(esp_err_t result)
   return;
 }
 
-void system_logs()
+void console_log()
 {
   currentMillis = millis();
   JsonDocument root;
@@ -886,11 +903,11 @@ void system_logs()
     root["rt_ctrl"] = settings_data.room_temp_control_en;
     root["room_t"] = settings_data.room_temp;
     root["alarm"] = settings_data.alarm_code;
-    root["calc_alarm"] = calculated_alarm_code;
+    root["cac"] = controller_alarm_code;
 
     //- output
     serializeJson(root, doc);
-    ESP_LOGD(TAG, "%s", doc);
+    ESP_LOGI(TAG, "%s", doc);
   }
 
   return;
@@ -1022,7 +1039,7 @@ void espnow_loop()
       // Set values to send
       outgoing_data.msg_type = DATA;
       outgoing_data.sender_role = CONTROLLER;
-      outgoing_data.alarm_code = calculated_alarm_code;
+      outgoing_data.alarm_code = controller_alarm_code;
       outgoing_data.air_return_temp = air_return_temp;
       outgoing_data.air_supply_temp = air_supply_temp;
       outgoing_data.drain_switch = float_sw_state;
@@ -1141,5 +1158,5 @@ void loop()
   update_IO();
   update_compressor_runtime();
   espnow_loop();
-  system_logs();
+  console_log();
 }
